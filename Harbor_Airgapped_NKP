@@ -7,7 +7,7 @@
 set -e # Exit on any error
 
 # Step 1: Set up environment variables
-export REGISTRY_URL="http://10.0.0.114"  # Change this to your Harbor URL
+export REGISTRY_URL="http://x.x.x.x"  # Change this to your Harbor URL
 export REGISTRY_USERNAME="admin"
 export REGISTRY_PASSWORD="Harbor12345"   # Change this to your Harbor password
 
