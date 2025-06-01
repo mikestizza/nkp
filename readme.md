@@ -1,6 +1,6 @@
 # Harbor Registry Setup Tool
 
-This script sets up a Harbor registry for NKP deployments in networks without internet access.
+This script sets up a private Harbor registry for NKP deployments.
 
 ## What This Script Does
 
