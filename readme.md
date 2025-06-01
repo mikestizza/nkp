@@ -60,7 +60,7 @@ If you get errors about missing images during deployment:
 
 ## Important Settings
 
-- Default Harbor URL: `http://10.0.0.114`
+- Default Harbor URL: `http://YOUR_HARBOR_IP_OR_NAME`
 - Default username: `admin`
 - Default password: `Harbor12345`
 
