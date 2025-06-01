@@ -4,7 +4,7 @@
 set -e
 
 # Version and metadata
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SCRIPT_NAME="Portable NKP Harbor Deployment"
 
 # Default configuration - can be overridden
@@ -12,6 +12,7 @@ DEFAULT_HARBOR_PORT="80"
 DEFAULT_HARBOR_USERNAME="admin"
 DEFAULT_HARBOR_PASSWORD="Harbor12345"
 DEFAULT_NKP_VERSION="2.15.0"
+DEFAULT_HARBOR_PROJECT="library"
 
 # Color output functions
 if [[ -t 1 ]]; then  # Check if stdout is a terminal
@@ -69,6 +70,7 @@ load_config_file() {
                 HARBOR_PORT) HARBOR_PORT="$value" ;;
                 HARBOR_USERNAME) HARBOR_USERNAME="$value" ;;
                 HARBOR_PASSWORD) HARBOR_PASSWORD="$value" ;;
+                HARBOR_PROJECT) HARBOR_PROJECT="$value" ;;
                 NKP_VERSION) NKP_VERSION="$value" ;;
                 NKP_BUNDLE_DIR) NKP_BUNDLE_DIR="$value" ;;
                 USE_HTTPS) USE_HTTPS="$value" ;;
@@ -145,6 +147,47 @@ auto_detect_environment() {
     fi
 }
 
+# Create Harbor project
+create_harbor_project() {
+    local project_name="$1"
+    
+    log "Creating Harbor project: $project_name"
+    
+    # Check if project already exists
+    local project_url="$HARBOR_URL/api/v2.0/projects?name=$project_name"
+    local existing_project=$(curl -s -u "$HARBOR_USERNAME:$HARBOR_PASSWORD" "$project_url")
+    
+    if echo "$existing_project" | jq -e '.[] | select(.name == "'$project_name'")' > /dev/null 2>&1; then
+        success "Project '$project_name' already exists"
+        return 0
+    fi
+    
+    # Create new project
+    local create_url="$HARBOR_URL/api/v2.0/projects"
+    local project_data='{
+        "project_name": "'$project_name'",
+        "public": false,
+        "metadata": {
+            "public": "false"
+        }
+    }'
+    
+    local response=$(curl -s -w "%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -u "$HARBOR_USERNAME:$HARBOR_PASSWORD" \
+        -d "$project_data" \
+        "$create_url")
+    
+    local http_code="${response: -3}"
+    
+    if [[ "$http_code" == "201" ]]; then
+        success "Project '$project_name' created successfully"
+    else
+        error "Failed to create project '$project_name' (HTTP: $http_code)"
+        return 1
+    fi
+}
+
 # Interactive configuration
 interactive_config() {
     echo ""
@@ -186,6 +229,24 @@ interactive_config() {
     echo ""
     HARBOR_PASSWORD="${input:-$DEFAULT_HARBOR_PASSWORD}"
     
+    # Harbor project configuration
+    echo ""
+    info "Harbor Project Configuration"
+    echo "============================"
+    read -p "Harbor project name [$DEFAULT_HARBOR_PROJECT]: " input
+    HARBOR_PROJECT="${input:-$DEFAULT_HARBOR_PROJECT}"
+    
+    if [[ "$HARBOR_PROJECT" != "library" ]]; then
+        read -p "Create new project '$HARBOR_PROJECT' if it doesn't exist? (Y/n): " input
+        if [[ ! "${input,,}" =~ ^n ]]; then
+            CREATE_PROJECT="true"
+        else
+            CREATE_PROJECT="false"
+        fi
+    else
+        CREATE_PROJECT="false"
+    fi
+    
     # NKP Version
     read -p "NKP version [$DEFAULT_NKP_VERSION]: " input
     NKP_VERSION="${input:-$DEFAULT_NKP_VERSION}"
@@ -211,6 +272,7 @@ HARBOR_HOST="$HARBOR_HOST"
 HARBOR_PORT="$HARBOR_PORT"
 HARBOR_USERNAME="$HARBOR_USERNAME"
 HARBOR_PASSWORD="$HARBOR_PASSWORD"
+HARBOR_PROJECT="$HARBOR_PROJECT"
 USE_HTTPS="$USE_HTTPS"
 
 # NKP Configuration  
@@ -276,7 +338,7 @@ verify_harbor() {
         info "  - Harbor is running and accessible"
         info "  - Hostname/IP is correct: $HARBOR_HOST"
         info "  - Port is correct: $HARBOR_PORT"
-        info "  - Protocol is correct: ${USE_HTTPS:+HTTPS}${USE_HTTPS:-HTTP}"
+        info "  - Protocol is correct: $(format_protocol)"
         return 1
     fi
     
@@ -290,6 +352,15 @@ verify_harbor() {
     fi
     
     success "Harbor authentication successful"
+}
+
+# Format protocol display
+format_protocol() {
+    if [[ "${USE_HTTPS,,}" == "true" ]]; then
+        echo "HTTPS"
+    else
+        echo "HTTP"
+    fi
 }
 
 # Verify NKP bundles
@@ -388,9 +459,9 @@ configure_docker_daemon() {
     fi
 }
 
-# Push bundles using the /library namespace discovery
+# Push bundles using the specified project namespace
 push_bundles() {
-    log "Pushing NKP bundles using /library namespace..."
+    log "Pushing NKP bundles using /$HARBOR_PROJECT namespace..."
     
     local bundles=(
         "$NKP_BUNDLE_DIR/container-images/konvoy-image-bundle-v$NKP_VERSION.tar"
@@ -400,8 +471,8 @@ push_bundles() {
     local success_count=0
     local total_images=0
     
-    # Use /library namespace - this was our key discovery!
-    local registry_url="$HARBOR_URL/library"
+    # Use the specified project namespace
+    local registry_url="$HARBOR_URL/$HARBOR_PROJECT"
     
     for bundle in "${bundles[@]}"; do
         if [[ -f "$bundle" ]]; then
@@ -456,22 +527,18 @@ generate_summary() {
     echo "📋 DEPLOYMENT SUMMARY"
     echo "===================="
     echo "Harbor URL: $HARBOR_URL"
-    echo "Registry URL: $HARBOR_URL/library"
+    echo "Registry URL: $HARBOR_URL/$HARBOR_PROJECT"
+    echo "Project: $HARBOR_PROJECT"
     echo "Username: $HARBOR_USERNAME"
     echo "Password: $HARBOR_PASSWORD"
-    echo "Protocol: ${USE_HTTPS:+HTTPS}${USE_HTTPS:-HTTP}"
-    echo ""
-    echo "🚀 FOR NKP CLUSTER DEPLOYMENT:"
-    echo "Registry URL: ${HARBOR_HOST}:${HARBOR_PORT}/library"
-    echo "Username: $HARBOR_USERNAME"
-    echo "Password: $HARBOR_PASSWORD"
+    echo "Protocol: $(format_protocol)"
     echo ""
     echo "🌐 WEB UI ACCESS:"
     echo "URL: $HARBOR_URL"
     echo "Username: $HARBOR_USERNAME"
     echo "Password: $HARBOR_PASSWORD"
     echo ""
-    echo "🎉 YOUR AIR-GAPPED REGISTRY IS READY FOR NKP DEPLOYMENT! 🎉"
+    echo "🎉 YOUR PRIVATE REGISTRY IS READY FOR NKP DEPLOYMENT! 🎉"
 }
 
 # Show usage
@@ -491,6 +558,7 @@ show_usage() {
     echo "  HARBOR_PORT         Harbor port (default: 80)"
     echo "  HARBOR_USERNAME     Harbor username (default: admin)"
     echo "  HARBOR_PASSWORD     Harbor password (default: Harbor12345)"
+    echo "  HARBOR_PROJECT      Harbor project name (default: library)"
     echo "  NKP_VERSION         NKP version (default: 2.15.0)"
     echo "  NKP_BUNDLE_DIR      NKP bundle directory"
     echo "  USE_HTTPS           Use HTTPS (true/false)"
@@ -573,15 +641,22 @@ main() {
     HARBOR_PORT="${HARBOR_PORT:-$DEFAULT_HARBOR_PORT}"
     HARBOR_USERNAME="${HARBOR_USERNAME:-$DEFAULT_HARBOR_USERNAME}"
     HARBOR_PASSWORD="${HARBOR_PASSWORD:-$DEFAULT_HARBOR_PASSWORD}"
+    HARBOR_PROJECT="${HARBOR_PROJECT:-$DEFAULT_HARBOR_PROJECT}"
     NKP_VERSION="${NKP_VERSION:-$DEFAULT_NKP_VERSION}"
     NKP_BUNDLE_DIR="${NKP_BUNDLE_DIR:-./nkp-v$NKP_VERSION}"
     USE_HTTPS="${USE_HTTPS:-false}"
+    CREATE_PROJECT="${CREATE_PROJECT:-false}"
     
     # Verify prerequisites
     verify_prerequisites || exit 1
     
     # Verify Harbor
     verify_harbor || exit 1
+    
+    # Create Harbor project if needed
+    if [[ "${CREATE_PROJECT,,}" == "true" ]] && [[ "$HARBOR_PROJECT" != "library" ]]; then
+        create_harbor_project "$HARBOR_PROJECT" || exit 1
+    fi
     
     # Verify NKP bundles
     verify_nkp_bundles || exit 1
