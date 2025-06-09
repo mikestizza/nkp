@@ -1,18 +1,22 @@
 #!/bin/bash
-# Portable NKP Harbor Deployment Script
+# Enhanced Portable NKP Harbor Deployment Script with Problem Detection & Resolution
 
 set -e
 
 # Version and metadata
-SCRIPT_VERSION="1.0.1"
-SCRIPT_NAME="Portable NKP Harbor Deployment"
+SCRIPT_VERSION="1.1.0"
+SCRIPT_NAME="Enhanced NKP Harbor Deployment"
 
 # Default configuration - can be overridden
 DEFAULT_HARBOR_PORT="80"
 DEFAULT_HARBOR_USERNAME="admin"
 DEFAULT_HARBOR_PASSWORD="Harbor12345"
 DEFAULT_NKP_VERSION="2.15.0"
-DEFAULT_HARBOR_PROJECT="library"
+DEFAULT_HARBOR_PROJECT="nkp"
+
+# Minimum system requirements
+MIN_DISK_SPACE_GB=50
+MIN_MEMORY_GB=4
 
 # Color output functions
 if [[ -t 1 ]]; then  # Check if stdout is a terminal
@@ -44,7 +48,7 @@ show_banner() {
     echo "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀"
     echo "🚀                                                                    🚀"
     echo "🚀    $SCRIPT_NAME v$SCRIPT_VERSION                        🚀"
-    echo "🚀    Portable across environments and configurations               🚀"
+    echo "🚀    Enhanced problem detection and auto-resolution               🚀"
     echo "🚀                                                                    🚀"
     echo "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀"
     echo -e "${NC}"
@@ -82,7 +86,732 @@ load_config_file() {
     fi
 }
 
-# Auto-detect environment
+# Enhanced system requirements checking with auto-setup
+check_system_requirements() {
+    log "Checking system requirements..."
+    
+    local issues=()
+    local auto_fixes=()
+    
+    # Check available disk space
+    local available_gb=$(df / | awk 'NR==2 {printf "%.0f", $4/1024/1024}')
+    if [[ $available_gb -lt $MIN_DISK_SPACE_GB ]]; then
+        issues+=("Insufficient disk space: ${available_gb}GB available, ${MIN_DISK_SPACE_GB}GB required")
+        
+        # Check if we can expand disk space
+        if command -v lvextend &> /dev/null && sudo vgs &>/dev/null; then
+            local vg_free=$(sudo vgs --noheadings -o vg_free --units g | grep -o '[0-9.]*' | head -1)
+            if [[ -n "$vg_free" ]] && (( $(echo "$vg_free > 10" | bc -l 2>/dev/null || echo 0) )); then
+                auto_fixes+=("expand_lvm:Expand LVM volume (+${vg_free}GB available)")
+            fi
+        fi
+        
+        # Always offer cleanup
+        auto_fixes+=("cleanup_docker:Clean up Docker resources")
+        auto_fixes+=("cleanup_system:Clean up system packages")
+    fi
+    
+    # Check available memory
+    local available_mem_gb=$(free -g | awk 'NR==2{printf "%.0f", $7}')
+    if [[ $available_mem_gb -lt $MIN_MEMORY_GB ]]; then
+        issues+=("Low available memory: ${available_mem_gb}GB available, ${MIN_MEMORY_GB}GB recommended")
+        auto_fixes+=("show_memory_tips:Show memory optimization tips")
+    fi
+    
+    # Check if running as root (which can cause permission issues)
+    if [[ "$EUID" -eq 0 ]]; then
+        warning "Running as root. This may cause permission issues with Docker."
+        info "Consider running as a non-root user in the docker group."
+    fi
+    
+    # Check Docker group membership
+    if ! groups | grep -q docker && [[ "$EUID" -ne 0 ]]; then
+        issues+=("User not in docker group")
+        auto_fixes+=("add_docker_group:Add current user to docker group")
+    fi
+    
+    # Check for swap space (helpful for memory-constrained systems)
+    local swap_mb=$(free -m | awk 'NR==3{print $2}')
+    if [[ "$swap_mb" -eq 0 ]] && [[ $available_mem_gb -lt 8 ]]; then
+        issues+=("No swap space configured (recommended for systems with <8GB RAM)")
+        auto_fixes+=("setup_swap:Create 2GB swap file")
+    fi
+    
+    if [[ ${#issues[@]} -gt 0 ]]; then
+        error "System requirement issues found:"
+        for issue in "${issues[@]}"; do
+            echo "  - $issue"
+        done
+        
+        if [[ ${#auto_fixes[@]} -gt 0 ]]; then
+            echo ""
+            warning "Available automatic fixes:"
+            for i in "${!auto_fixes[@]}"; do
+                local fix="${auto_fixes[$i]}"
+                local fix_desc="${fix#*:}"
+                echo "  $((i+1)). $fix_desc"
+            done
+            echo "  $((${#auto_fixes[@]}+1)). Continue without fixes"
+            echo "  $((${#auto_fixes[@]}+2)). Exit"
+            
+            read -p "Select option (1-$((${#auto_fixes[@]}+2))): " choice
+            
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [[ $choice -ge 1 ]] && [[ $choice -le ${#auto_fixes[@]} ]]; then
+                local selected_fix="${auto_fixes[$((choice-1))]}"
+                local fix_action="${selected_fix%%:*}"
+                apply_system_fix "$fix_action"
+            elif [[ "$choice" -eq $((${#auto_fixes[@]}+2)) ]]; then
+                exit 1
+            fi
+        else
+            read -p "Continue despite issues? (y/N): " input
+            if [[ ! "${input,,}" =~ ^y ]]; then
+                exit 1
+            fi
+        fi
+    else
+        success "System requirements check passed"
+    fi
+}
+
+# Apply system fixes based on user selection
+apply_system_fix() {
+    local fix_action="$1"
+    
+    case "$fix_action" in
+        "expand_lvm")
+            log "Expanding LVM volume..."
+            if sudo lvextend -l +100%FREE /dev/mapper/ubuntu--vg-ubuntu--lv 2>/dev/null; then
+                if sudo resize2fs /dev/mapper/ubuntu--vg-ubuntu--lv; then
+                    success "LVM volume expanded successfully"
+                    local new_available=$(df / | awk 'NR==2 {printf "%.0f", $4/1024/1024}')
+                    info "New available space: ${new_available}GB"
+                else
+                    error "Failed to resize filesystem"
+                fi
+            else
+                error "Failed to extend LVM volume"
+            fi
+            ;;
+        "cleanup_docker")
+            log "Cleaning up Docker resources..."
+            if docker system prune -af --volumes 2>/dev/null; then
+                success "Docker cleanup completed"
+                local freed=$(df / | awk 'NR==2 {printf "%.0f", $4/1024/1024}')
+                info "Available space after cleanup: ${freed}GB"
+            else
+                warning "Docker cleanup failed or Docker not available"
+            fi
+            ;;
+        "cleanup_system")
+            log "Cleaning up system packages..."
+            if sudo apt autoremove -y && sudo apt autoclean; then
+                success "System cleanup completed"
+            else
+                error "System cleanup failed"
+            fi
+            ;;
+        "add_docker_group")
+            log "Adding user to docker group..."
+            if sudo usermod -aG docker "$USER"; then
+                success "User added to docker group"
+                warning "Please log out and back in, or run: newgrp docker"
+                read -p "Run 'newgrp docker' now? (Y/n): " input
+                if [[ ! "${input,,}" =~ ^n ]]; then
+                    exec newgrp docker
+                fi
+            else
+                error "Failed to add user to docker group"
+            fi
+            ;;
+        "setup_swap")
+            log "Setting up 2GB swap file..."
+            if setup_swap_file; then
+                success "Swap file created successfully"
+            else
+                error "Failed to create swap file"
+            fi
+            ;;
+        "show_memory_tips")
+            info "Memory optimization tips:"
+            info "  - Close unnecessary applications"
+            info "  - Consider adding swap space"
+            info "  - Monitor memory usage: free -h"
+            info "  - Check for memory leaks: ps aux --sort=-%mem | head"
+            ;;
+    esac
+}
+
+# Enhanced Docker environment validation with auto-setup
+validate_docker_environment() {
+    log "Validating Docker environment..."
+    
+    local issues=()
+    local auto_fixes=()
+    
+    # Check Docker installation
+    if ! command -v docker &> /dev/null; then
+        issues+=("Docker not installed")
+        auto_fixes+=("install_docker:Install Docker Engine")
+    else
+        local docker_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
+        if [[ "$docker_version" == "unknown" ]]; then
+            issues+=("Docker daemon not running or accessible")
+            auto_fixes+=("start_docker:Start Docker daemon")
+        else
+            success "Docker version: $docker_version"
+        fi
+    fi
+    
+    # Check Docker Compose
+    if ! command -v docker-compose &> /dev/null; then
+        issues+=("Docker Compose not installed")
+        auto_fixes+=("install_compose:Install Docker Compose v2")
+    else
+        local compose_version=$(docker-compose version --short 2>/dev/null || echo "unknown")
+        if [[ "$compose_version" == "unknown" ]]; then
+            issues+=("Docker Compose not working properly")
+            auto_fixes+=("fix_compose:Fix Docker Compose installation")
+        elif [[ "$compose_version" =~ ^1\. ]]; then
+            warning "Old Docker Compose version detected: $compose_version"
+            auto_fixes+=("upgrade_compose:Upgrade to Docker Compose v2")
+        else
+            success "Docker Compose version: $compose_version"
+        fi
+    fi
+    
+    # Check for conflicting containerd installations
+    if dpkg -l | grep -q containerd.io && dpkg -l | grep -q containerd && ! dpkg -l | grep -q docker.io; then
+        issues+=("Conflicting containerd packages detected")
+        auto_fixes+=("fix_containerd:Resolve containerd conflicts")
+    fi
+    
+    # Check required tools
+    local missing_tools=()
+    local tools=("curl" "jq" "nc")
+    for tool in "${tools[@]}"; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_tools+=("$tool")
+        fi
+    done
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        issues+=("Missing required tools: ${missing_tools[*]}")
+        auto_fixes+=("install_tools:Install missing system tools")
+    fi
+    
+    # Check NKP binary
+    if ! command -v nkp &> /dev/null; then
+        issues+=("NKP binary not found")
+        auto_fixes+=("install_nkp:Download and install NKP binary")
+    fi
+    
+    # Check Docker daemon configuration
+    local daemon_json="/etc/docker/daemon.json"
+    if [[ -f "$daemon_json" ]]; then
+        if ! jq empty "$daemon_json" 2>/dev/null; then
+            issues+=("Invalid JSON in Docker daemon configuration")
+            auto_fixes+=("fix_daemon_json:Fix Docker daemon configuration")
+        fi
+    fi
+    
+    if [[ ${#issues[@]} -gt 0 ]]; then
+        error "Docker environment issues found:"
+        for issue in "${issues[@]}"; do
+            echo "  - $issue"
+        done
+        
+        if [[ ${#auto_fixes[@]} -gt 0 ]]; then
+            echo ""
+            warning "Available automatic fixes:"
+            for i in "${!auto_fixes[@]}"; do
+                local fix="${auto_fixes[$i]}"
+                local fix_desc="${fix#*:}"
+                echo "  $((i+1)). $fix_desc"
+            done
+            echo "  $((${#auto_fixes[@]}+1)). Fix all automatically"
+            echo "  $((${#auto_fixes[@]}+2)). Continue without fixes"
+            echo "  $((${#auto_fixes[@]}+3)). Exit"
+            
+            read -p "Select option (1-$((${#auto_fixes[@]}+3))): " choice
+            
+            if [[ "$choice" =~ ^[0-9]+$ ]]; then
+                if [[ $choice -ge 1 ]] && [[ $choice -le ${#auto_fixes[@]} ]]; then
+                    local selected_fix="${auto_fixes[$((choice-1))]}"
+                    local fix_action="${selected_fix%%:*}"
+                    apply_docker_fix "$fix_action"
+                elif [[ "$choice" -eq $((${#auto_fixes[@]}+1)) ]]; then
+                    log "Applying all fixes automatically..."
+                    for fix in "${auto_fixes[@]}"; do
+                        local fix_action="${fix%%:*}"
+                        apply_docker_fix "$fix_action"
+                    done
+                elif [[ "$choice" -eq $((${#auto_fixes[@]}+3)) ]]; then
+                    exit 1
+                fi
+            fi
+        else
+            exit 1
+        fi
+    else
+        success "Docker environment validation passed"
+    fi
+}
+
+# Apply Docker environment fixes
+apply_docker_fix() {
+    local fix_action="$1"
+    
+    case "$fix_action" in
+        "install_docker")
+            log "Installing Docker Engine..."
+            if sudo apt update && sudo apt install -y docker.io; then
+                success "Docker installed successfully"
+                if sudo systemctl enable docker && sudo systemctl start docker; then
+                    success "Docker daemon started"
+                fi
+            else
+                error "Failed to install Docker"
+            fi
+            ;;
+        "start_docker")
+            log "Starting Docker daemon..."
+            if sudo systemctl start docker && sudo systemctl enable docker; then
+                success "Docker daemon started"
+            else
+                error "Failed to start Docker daemon"
+            fi
+            ;;
+        "install_compose")
+            log "Installing Docker Compose v2..."
+            if install_docker_compose; then
+                success "Docker Compose installed successfully"
+            else
+                error "Failed to install Docker Compose"
+            fi
+            ;;
+        "upgrade_compose")
+            log "Upgrading to Docker Compose v2..."
+            sudo apt remove -y docker-compose 2>/dev/null || true
+            if install_docker_compose; then
+                success "Docker Compose upgraded successfully"
+            else
+                error "Failed to upgrade Docker Compose"
+            fi
+            ;;
+        "fix_compose")
+            log "Fixing Docker Compose installation..."
+            sudo apt remove -y docker-compose 2>/dev/null || true
+            if install_docker_compose; then
+                success "Docker Compose fixed successfully"
+            else
+                error "Failed to fix Docker Compose"
+            fi
+            ;;
+        "fix_containerd")
+            log "Resolving containerd conflicts..."
+            if sudo apt remove -y containerd && sudo apt install -y docker.io; then
+                success "Containerd conflicts resolved"
+            else
+                error "Failed to resolve containerd conflicts"
+            fi
+            ;;
+        "install_tools")
+            log "Installing missing system tools..."
+            if sudo apt update && sudo apt install -y curl jq netcat-openbsd; then
+                success "System tools installed successfully"
+            else
+                error "Failed to install system tools"
+            fi
+            ;;
+        "install_nkp")
+            log "Installing NKP binary..."
+            if install_nkp_binary; then
+                success "NKP binary installed successfully"
+            else
+                error "Failed to install NKP binary"
+            fi
+            ;;
+        "fix_daemon_json")
+            log "Fixing Docker daemon configuration..."
+            local daemon_json="/etc/docker/daemon.json"
+            if sudo cp "$daemon_json" "${daemon_json}.backup.$(date +%Y%m%d_%H%M%S)"; then
+                echo '{}' | sudo tee "$daemon_json" > /dev/null
+                success "Docker daemon configuration fixed"
+            else
+                error "Failed to fix Docker daemon configuration"
+            fi
+            ;;
+    esac
+}
+
+# Helper function to create swap file
+setup_swap_file() {
+    local swap_size="2G"
+    local swap_file="/swapfile"
+    
+    log "Creating ${swap_size} swap file at ${swap_file}..."
+    
+    # Check if swap file already exists
+    if [[ -f "$swap_file" ]]; then
+        warning "Swap file already exists at $swap_file"
+        return 0
+    fi
+    
+    # Create swap file
+    if sudo fallocate -l "$swap_size" "$swap_file" 2>/dev/null || sudo dd if=/dev/zero of="$swap_file" bs=1M count=2048; then
+        sudo chmod 600 "$swap_file"
+        if sudo mkswap "$swap_file" && sudo swapon "$swap_file"; then
+            # Add to fstab for persistence
+            if ! grep -q "$swap_file" /etc/fstab; then
+                echo "$swap_file none swap sw 0 0" | sudo tee -a /etc/fstab
+            fi
+            success "Swap file created and activated"
+            return 0
+        else
+            error "Failed to activate swap file"
+            sudo rm -f "$swap_file"
+            return 1
+        fi
+    else
+        error "Failed to create swap file"
+        return 1
+    fi
+}
+
+# Helper function to install Docker Compose
+install_docker_compose() {
+    local compose_url="https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)"
+    local compose_path="/usr/local/bin/docker-compose"
+    
+    if sudo curl -L "$compose_url" -o "$compose_path" && sudo chmod +x "$compose_path"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Helper function to install NKP binary
+install_nkp_binary() {
+    log "Detecting NKP binary in current directory..."
+    
+    # Check if NKP binary exists in current directory
+    local nkp_candidates=("./nkp" "./nkp_v*_linux_amd64" "./nkp-*")
+    local found_nkp=""
+    
+    for pattern in "${nkp_candidates[@]}"; do
+        local files=($(ls $pattern 2>/dev/null))
+        for file in "${files[@]}"; do
+            if [[ -f "$file" ]] && [[ -x "$file" || "$file" == *.tar.gz ]]; then
+                found_nkp="$file"
+                break 2
+            fi
+        done
+    done
+    
+    if [[ -n "$found_nkp" ]]; then
+        if [[ "$found_nkp" == *.tar.gz ]]; then
+            log "Extracting NKP from $found_nkp..."
+            if tar -xzf "$found_nkp" nkp 2>/dev/null; then
+                found_nkp="./nkp"
+            else
+                error "Failed to extract NKP from $found_nkp"
+                return 1
+            fi
+        fi
+        
+        log "Installing NKP binary from $found_nkp..."
+        if sudo cp "$found_nkp" /usr/local/bin/nkp && sudo chmod +x /usr/local/bin/nkp; then
+            success "NKP binary installed to /usr/local/bin/nkp"
+            return 0
+        else
+            error "Failed to install NKP binary"
+            return 1
+        fi
+    else
+        warning "NKP binary not found in current directory"
+        info "Please download NKP from: https://github.com/mesosphere/konvoy/releases"
+        info "Available options:"
+        info "  1. Download manually and place in current directory"
+        info "  2. Continue without NKP (bundle push will fail)"
+        
+        read -p "Download NKP automatically? (y/N): " input
+        if [[ "${input,,}" =~ ^y ]]; then
+            return download_nkp_binary
+        else
+            return 1
+        fi
+    fi
+}
+
+# Helper function to download NKP binary
+download_nkp_binary() {
+    local nkp_version="${NKP_VERSION:-$DEFAULT_NKP_VERSION}"
+    local arch="linux_amd64"
+    local download_url="https://github.com/mesosphere/konvoy/releases/download/v${nkp_version}/nkp_v${nkp_version}_${arch}.tar.gz"
+    
+    log "Downloading NKP v${nkp_version} for ${arch}..."
+    
+    if curl -L "$download_url" -o "nkp_v${nkp_version}_${arch}.tar.gz"; then
+        if tar -xzf "nkp_v${nkp_version}_${arch}.tar.gz" nkp; then
+            if sudo cp nkp /usr/local/bin/nkp && sudo chmod +x /usr/local/bin/nkp; then
+                success "NKP v${nkp_version} downloaded and installed"
+                rm -f "nkp_v${nkp_version}_${arch}.tar.gz" nkp
+                return 0
+            fi
+        fi
+    fi
+    
+    error "Failed to download and install NKP binary"
+    return 1
+}
+
+# Enhanced Harbor setup with missing component detection
+setup_harbor_environment() {
+    log "Checking Harbor environment setup..."
+    
+    local harbor_issues=()
+    local harbor_fixes=()
+    
+    # Check if Harbor is installed
+    if ! docker images | grep -q goharbor; then
+        harbor_issues+=("Harbor Docker images not found")
+        
+        # Check for Harbor installer
+        local harbor_installer=""
+        local harbor_patterns=("harbor-offline-installer-*.tgz" "harbor-online-installer-*.tgz" "./harbor")
+        
+        for pattern in "${harbor_patterns[@]}"; do
+            local files=($(ls $pattern 2>/dev/null))
+            if [[ ${#files[@]} -gt 0 ]]; then
+                harbor_installer="${files[0]}"
+                break
+            fi
+        done
+        
+        if [[ -n "$harbor_installer" ]] && [[ -f "$harbor_installer" ]]; then
+            harbor_fixes+=("install_harbor_from_file:Install Harbor from $harbor_installer")
+        else
+            harbor_fixes+=("download_install_harbor:Download and install Harbor")
+        fi
+    fi
+    
+    # Check if Harbor is running
+    if ! docker ps | grep -q harbor; then
+        harbor_issues+=("Harbor containers not running")
+        if docker images | grep -q goharbor; then
+            harbor_fixes+=("start_harbor:Start existing Harbor installation")
+        fi
+    fi
+    
+    # Check Harbor accessibility
+    if docker ps | grep -q harbor; then
+        local harbor_port=$(docker ps | grep harbor | grep -o '0\.0\.0\.0:[0-9]*->8080' | cut -d: -f2 | cut -d- -f1 | head -1)
+        if [[ -n "$harbor_port" ]]; then
+            if ! curl -s "http://localhost:$harbor_port" | grep -q Harbor; then
+                harbor_issues+=("Harbor web interface not accessible")
+                harbor_fixes+=("restart_harbor:Restart Harbor services")
+            fi
+        fi
+    fi
+    
+    if [[ ${#harbor_issues[@]} -gt 0 ]]; then
+        warning "Harbor environment issues found:"
+        for issue in "${harbor_issues[@]}"; do
+            echo "  - $issue"
+        done
+        
+        if [[ ${#harbor_fixes[@]} -gt 0 ]]; then
+            echo ""
+            info "Available Harbor setup options:"
+            for i in "${!harbor_fixes[@]}"; do
+                local fix="${harbor_fixes[$i]}"
+                local fix_desc="${fix#*:}"
+                echo "  $((i+1)). $fix_desc"
+            done
+            echo "  $((${#harbor_fixes[@]}+1)). Skip Harbor setup (manual configuration required)"
+            echo "  $((${#harbor_fixes[@]}+2)). Exit"
+            
+            read -p "Select option (1-$((${#harbor_fixes[@]}+2))): " choice
+            
+            if [[ "$choice" =~ ^[0-9]+$ ]]; then
+                if [[ $choice -ge 1 ]] && [[ $choice -le ${#harbor_fixes[@]} ]]; then
+                    local selected_fix="${harbor_fixes[$((choice-1))]}"
+                    local fix_action="${selected_fix%%:*}"
+                    apply_harbor_fix "$fix_action"
+                elif [[ "$choice" -eq $((${#harbor_fixes[@]}+2)) ]]; then
+                    exit 1
+                fi
+            fi
+        fi
+    else
+        success "Harbor environment is ready"
+    fi
+}
+
+# Apply Harbor environment fixes
+apply_harbor_fix() {
+    local fix_action="$1"
+    
+    case "$fix_action" in
+        "install_harbor_from_file")
+            log "Installing Harbor from existing file..."
+            local installer=$(ls harbor-offline-installer-*.tgz harbor-online-installer-*.tgz 2>/dev/null | head -1)
+            if [[ -n "$installer" ]]; then
+                if install_harbor_from_package "$installer"; then
+                    success "Harbor installed successfully"
+                else
+                    error "Failed to install Harbor from $installer"
+                fi
+            fi
+            ;;
+        "download_install_harbor")
+            log "Downloading and installing Harbor..."
+            if download_and_install_harbor; then
+                success "Harbor downloaded and installed successfully"
+            else
+                error "Failed to download and install Harbor"
+            fi
+            ;;
+        "start_harbor")
+            log "Starting existing Harbor installation..."
+            if start_harbor_services; then
+                success "Harbor services started successfully"
+            else
+                error "Failed to start Harbor services"
+            fi
+            ;;
+        "restart_harbor")
+            log "Restarting Harbor services..."
+            if restart_harbor_services; then
+                success "Harbor services restarted successfully"
+            else
+                error "Failed to restart Harbor services"
+            fi
+            ;;
+    esac
+}
+
+# Helper function to install Harbor from package
+install_harbor_from_package() {
+    local package_file="$1"
+    local temp_dir=$(mktemp -d)
+    
+    log "Extracting Harbor installer: $package_file"
+    if tar -xzf "$package_file" -C "$temp_dir"; then
+        local harbor_dir="$temp_dir/harbor"
+        if [[ -d "$harbor_dir" ]]; then
+            cd "$harbor_dir"
+            
+            # Create basic configuration
+            if [[ -f "harbor.yml.tmpl" ]] && [[ ! -f "harbor.yml" ]]; then
+                cp harbor.yml.tmpl harbor.yml
+                
+                # Basic configuration setup
+                local host_ip=$(hostname -I | awk '{print $1}')
+                sed -i "s/hostname: reg.mydomain.com/hostname: ${host_ip:-localhost}/" harbor.yml
+                sed -i '/^https:/,/^[[:space:]]*certificate:/ s/^/#/' harbor.yml
+                sed -i '/^[[:space:]]*private_key:/ s/^/#/' harbor.yml
+            fi
+            
+            # Install Harbor
+            if sudo ./install.sh; then
+                cd - > /dev/null
+                rm -rf "$temp_dir"
+                return 0
+            fi
+        fi
+    fi
+    
+    rm -rf "$temp_dir"
+    return 1
+}
+
+# Helper function to download and install Harbor
+download_and_install_harbor() {
+    local harbor_version="v2.10.0"
+    local harbor_url="https://github.com/goharbor/harbor/releases/download/${harbor_version}/harbor-offline-installer-${harbor_version}.tgz"
+    
+    log "Downloading Harbor ${harbor_version}..."
+    if curl -L "$harbor_url" -o "harbor-offline-installer-${harbor_version}.tgz"; then
+        return install_harbor_from_package "harbor-offline-installer-${harbor_version}.tgz"
+    else
+        return 1
+    fi
+}
+
+# Helper function to start Harbor services
+start_harbor_services() {
+    local harbor_dirs=("./harbor" "../harbor" "/opt/harbor")
+    
+    for dir in "${harbor_dirs[@]}"; do
+        if [[ -d "$dir" ]] && [[ -f "$dir/docker-compose.yml" ]]; then
+            cd "$dir"
+            if sudo docker-compose up -d; then
+                cd - > /dev/null
+                return 0
+            fi
+            cd - > /dev/null
+        fi
+    done
+    
+    return 1
+}
+
+# Helper function to restart Harbor services
+restart_harbor_services() {
+    local harbor_dirs=("./harbor" "../harbor" "/opt/harbor")
+    
+    for dir in "${harbor_dirs[@]}"; do
+        if [[ -d "$dir" ]] && [[ -f "$dir/docker-compose.yml" ]]; then
+            cd "$dir"
+            if sudo docker-compose restart; then
+                cd - > /dev/null
+                return 0
+            fi
+            cd - > /dev/null
+        fi
+    done
+    
+    return 1
+}
+
+# Enhanced Harbor container state management
+manage_harbor_containers() {
+    log "Managing Harbor container state..."
+    
+    # Check for existing Harbor containers
+    local existing_containers=$(docker ps -aq --filter "name=harbor" 2>/dev/null || true)
+    
+    if [[ -n "$existing_containers" ]]; then
+        warning "Found existing Harbor containers"
+        
+        # Check for problematic containers (those that failed to start properly)
+        local problematic=$(docker ps -a --filter "name=harbor" --filter "status=exited" --format "{{.Names}}: {{.Status}}" 2>/dev/null || true)
+        if [[ -n "$problematic" ]]; then
+            warning "Found problematic Harbor containers:"
+            echo "$problematic"
+            
+            log "Cleaning up problematic containers..."
+            docker stop $existing_containers 2>/dev/null || true
+            docker rm -f $existing_containers 2>/dev/null || true
+            
+            # Clean up associated resources
+            docker network ls --filter "name=harbor" --format "{{.ID}}" | xargs -r docker network rm 2>/dev/null || true
+            docker volume ls --filter "name=harbor" --format "{{.Name}}" | xargs -r docker volume rm 2>/dev/null || true
+            
+            success "Cleaned up problematic Harbor containers"
+        fi
+    fi
+    
+    # Clean up any orphaned or corrupted image metadata
+    if docker images --filter "dangling=true" -q | grep -q .; then
+        log "Cleaning up dangling images..."
+        docker image prune -f
+    fi
+}
+
+# Auto-detect environment with enhanced logic
 auto_detect_environment() {
     log "Auto-detecting environment..."
     
@@ -147,7 +876,7 @@ auto_detect_environment() {
     fi
 }
 
-# Create Harbor project
+# Enhanced Harbor project creation with error handling
 create_harbor_project() {
     local project_name="$1"
     
@@ -155,14 +884,14 @@ create_harbor_project() {
     
     # Check if project already exists
     local project_url="$HARBOR_URL/api/v2.0/projects?name=$project_name"
-    local existing_project=$(curl -s -u "$HARBOR_USERNAME:$HARBOR_PASSWORD" "$project_url")
+    local existing_project=$(curl -s -u "$HARBOR_USERNAME:$HARBOR_PASSWORD" "$project_url" 2>/dev/null || echo "[]")
     
     if echo "$existing_project" | jq -e '.[] | select(.name == "'$project_name'")' > /dev/null 2>&1; then
         success "Project '$project_name' already exists"
         return 0
     fi
     
-    # Create new project
+    # Create new project with retry logic
     local create_url="$HARBOR_URL/api/v2.0/projects"
     local project_data='{
         "project_name": "'$project_name'",
@@ -172,20 +901,35 @@ create_harbor_project() {
         }
     }'
     
-    local response=$(curl -s -w "%{http_code}" -X POST \
-        -H "Content-Type: application/json" \
-        -u "$HARBOR_USERNAME:$HARBOR_PASSWORD" \
-        -d "$project_data" \
-        "$create_url")
+    local max_retries=3
+    local retry_count=0
     
-    local http_code="${response: -3}"
+    while [[ $retry_count -lt $max_retries ]]; do
+        local response=$(curl -s -w "%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -u "$HARBOR_USERNAME:$HARBOR_PASSWORD" \
+            -d "$project_data" \
+            "$create_url" 2>/dev/null || echo "000")
+        
+        local http_code="${response: -3}"
+        
+        if [[ "$http_code" == "201" ]]; then
+            success "Project '$project_name' created successfully"
+            return 0
+        elif [[ "$http_code" == "409" ]]; then
+            success "Project '$project_name' already exists (created concurrently)"
+            return 0
+        else
+            warning "Attempt $((retry_count + 1)) failed (HTTP: $http_code)"
+            ((retry_count++))
+            if [[ $retry_count -lt $max_retries ]]; then
+                sleep 2
+            fi
+        fi
+    done
     
-    if [[ "$http_code" == "201" ]]; then
-        success "Project '$project_name' created successfully"
-    else
-        error "Failed to create project '$project_name' (HTTP: $http_code)"
-        return 1
-    fi
+    error "Failed to create project '$project_name' after $max_retries attempts"
+    return 1
 }
 
 # Interactive configuration
@@ -303,55 +1047,112 @@ build_harbor_url() {
     fi
 }
 
-# Verify prerequisites
+# Verify prerequisites with enhanced checking
 verify_prerequisites() {
     log "Verifying prerequisites..."
     
     local missing_tools=()
+    local version_issues=()
     
-    # Check required tools
-    for tool in docker curl jq nkp; do
+    # Check required tools with version validation
+    local tools_versions=(
+        "docker:Docker version"
+        "curl:curl"
+        "jq:jq"
+        "nkp:nkp version"
+    )
+    
+    for tool_info in "${tools_versions[@]}"; do
+        local tool="${tool_info%%:*}"
+        local version_cmd="${tool_info##*:}"
+        
         if ! command -v "$tool" &> /dev/null; then
             missing_tools+=("$tool")
+        else
+            # Get version info for diagnostic purposes
+            local version_output=$($version_cmd 2>/dev/null || echo "version unknown")
+            success "$tool available: $version_output"
         fi
     done
     
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         error "Missing required tools: ${missing_tools[*]}"
-        info "Please install the missing tools and try again."
+        info "Installation commands:"
+        for tool in "${missing_tools[@]}"; do
+            case "$tool" in
+                docker) info "  sudo apt install docker.io" ;;
+                curl) info "  sudo apt install curl" ;;
+                jq) info "  sudo apt install jq" ;;
+                nkp) info "  Download from: https://github.com/mesosphere/konvoy/releases" ;;
+            esac
+        done
         return 1
     fi
     
     success "All required tools are available"
 }
 
-# Verify Harbor connectivity
+# Enhanced Harbor connectivity verification
 verify_harbor() {
     log "Verifying Harbor connectivity..."
     
     build_harbor_url
     
+    # Test basic connectivity first
+    if ! curl -s --connect-timeout 10 "$HARBOR_HOST:$HARBOR_PORT" > /dev/null 2>&1; then
+        error "Cannot connect to Harbor at: $HARBOR_HOST:$HARBOR_PORT"
+        info "Troubleshooting steps:"
+        info "  1. Check if Harbor is running: docker ps | grep harbor"
+        info "  2. Verify network connectivity: ping $HARBOR_HOST"
+        info "  3. Check firewall rules"
+        info "  4. Verify Harbor installation"
+        return 1
+    fi
+    
+    # Test Harbor health endpoint
     local health_url="$HARBOR_URL/api/v2.0/health"
-    if ! curl -s --connect-timeout 10 "$health_url" | grep -q "healthy"; then
-        error "Harbor is not healthy or not accessible at: $HARBOR_URL"
-        info "Please check:"
-        info "  - Harbor is running and accessible"
-        info "  - Hostname/IP is correct: $HARBOR_HOST"
-        info "  - Port is correct: $HARBOR_PORT"
-        info "  - Protocol is correct: $(format_protocol)"
-        return 1
+    local health_response=$(curl -s --connect-timeout 10 "$health_url" 2>/dev/null || echo "")
+    
+    if ! echo "$health_response" | grep -q "healthy"; then
+        warning "Harbor health check failed"
+        info "Health response: $health_response"
+        
+        # Try alternative health checks
+        local basic_url="$HARBOR_URL/"
+        if curl -s --connect-timeout 10 "$basic_url" | grep -q "Harbor"; then
+            warning "Harbor web interface accessible but API may not be ready"
+            info "Waiting for Harbor to fully initialize..."
+            sleep 10
+        else
+            error "Harbor is not accessible at: $HARBOR_URL"
+            return 1
+        fi
+    else
+        success "Harbor is healthy and accessible"
     fi
     
-    success "Harbor is healthy and accessible"
+    # Test authentication with improved error handling
+    local auth_test_url="$HARBOR_URL/api/v2.0/projects"
+    local auth_response=$(curl -s -w "%{http_code}" -u "$HARBOR_USERNAME:$HARBOR_PASSWORD" "$auth_test_url" 2>/dev/null || echo "000")
+    local auth_http_code="${auth_response: -3}"
     
-    # Test authentication
-    if ! curl -s -u "$HARBOR_USERNAME:$HARBOR_PASSWORD" "$HARBOR_URL/api/v2.0/projects" > /dev/null; then
-        error "Harbor authentication failed"
-        info "Please check username and password"
-        return 1
-    fi
-    
-    success "Harbor authentication successful"
+    case "$auth_http_code" in
+        200) success "Harbor authentication successful" ;;
+        401) 
+            error "Harbor authentication failed - invalid credentials"
+            info "Please check username and password"
+            return 1
+            ;;
+        403)
+            error "Harbor authentication failed - access forbidden"
+            info "User may not have required permissions"
+            return 1
+            ;;
+        *)
+            warning "Harbor authentication test inconclusive (HTTP: $auth_http_code)"
+            info "Continuing with deployment..."
+            ;;
+    esac
 }
 
 # Format protocol display
@@ -363,12 +1164,17 @@ format_protocol() {
     fi
 }
 
-# Verify NKP bundles
+# Enhanced NKP bundle verification
 verify_nkp_bundles() {
     log "Verifying NKP bundles..."
     
     if [[ ! -d "$NKP_BUNDLE_DIR" ]]; then
         error "NKP bundle directory not found: $NKP_BUNDLE_DIR"
+        info "Expected directory structure:"
+        info "  $NKP_BUNDLE_DIR/"
+        info "  └── container-images/"
+        info "      ├── konvoy-image-bundle-v$NKP_VERSION.tar"
+        info "      └── kommander-image-bundle-v$NKP_VERSION.tar"
         return 1
     fi
     
@@ -384,10 +1190,20 @@ verify_nkp_bundles() {
     )
     
     local found_bundles=0
+    local total_size=0
+    
     for bundle in "${bundles[@]}"; do
         if [[ -f "$bundle" ]]; then
-            success "Found bundle: $(basename "$bundle")"
+            local size_mb=$(du -m "$bundle" | cut -f1)
+            success "Found bundle: $(basename "$bundle") (${size_mb}MB)"
             ((found_bundles++))
+            total_size=$((total_size + size_mb))
+            
+            # Verify bundle is not corrupted (basic check)
+            if ! tar -tf "$bundle" > /dev/null 2>&1; then
+                error "Bundle appears corrupted: $(basename "$bundle")"
+                return 1
+            fi
         else
             warning "Bundle not found: $(basename "$bundle")"
         fi
@@ -395,28 +1211,37 @@ verify_nkp_bundles() {
     
     if [[ $found_bundles -eq 0 ]]; then
         error "No NKP bundles found in: $bundle_dir"
+        info "Available files:"
+        ls -la "$bundle_dir" 2>/dev/null || echo "Directory not accessible"
         return 1
     fi
     
+    info "Total bundle size: ${total_size}MB"
     success "NKP bundles verified ($found_bundles found)"
 }
 
-# Configure Docker daemon for insecure registry
+# Enhanced Docker daemon configuration
 configure_docker_daemon() {
     log "Configuring Docker daemon for insecure registry..."
     
     local daemon_json="/etc/docker/daemon.json"
     local needs_restart=false
     
+    # Build registry entry
+    local registry_entry="$HARBOR_HOST"
+    if [[ "$HARBOR_PORT" != "80" ]]; then
+        registry_entry="$HARBOR_HOST:$HARBOR_PORT"
+    fi
+    
     # Check if already configured
-    if [[ -f "$daemon_json" ]] && grep -q "$HARBOR_HOST" "$daemon_json"; then
+    if [[ -f "$daemon_json" ]] && jq -e --arg registry "$registry_entry" '.["insecure-registries"] | index($registry)' "$daemon_json" > /dev/null 2>&1; then
         success "Docker daemon already configured for Harbor registry"
         return 0
     fi
     
     # Only configure for HTTP (insecure) registries
     if [[ "${USE_HTTPS,,}" != "true" ]]; then
-        warning "HTTP registry detected - Docker daemon configuration may be needed"
+        warning "HTTP registry detected - Docker daemon configuration needed"
         
         if [[ "$EUID" -eq 0 ]] || groups | grep -q docker; then
             info "Configuring Docker daemon for insecure registry..."
@@ -427,17 +1252,18 @@ configure_docker_daemon() {
             fi
             
             # Create or update daemon.json
-            local registry_entry="$HARBOR_HOST"
-            if [[ "$HARBOR_PORT" != "80" ]]; then
-                registry_entry="$HARBOR_HOST:$HARBOR_PORT"
-            fi
-            
             if [[ -f "$daemon_json" ]]; then
                 # Update existing file
-                sudo jq --arg registry "$registry_entry" \
+                local temp_file=$(mktemp)
+                if sudo jq --arg registry "$registry_entry" \
                     '.["insecure-registries"] = (.["insecure-registries"] // []) + [$registry] | .["insecure-registries"] |= unique' \
-                    "$daemon_json" > /tmp/daemon.json.tmp
-                sudo mv /tmp/daemon.json.tmp "$daemon_json"
+                    "$daemon_json" > "$temp_file" 2>/dev/null; then
+                    sudo mv "$temp_file" "$daemon_json"
+                else
+                    rm -f "$temp_file"
+                    error "Failed to update Docker daemon configuration"
+                    return 1
+                fi
             else
                 # Create new file
                 echo "{\"insecure-registries\": [\"$registry_entry\"]}" | sudo tee "$daemon_json" > /dev/null
@@ -447,19 +1273,29 @@ configure_docker_daemon() {
         else
             warning "Cannot configure Docker daemon (no sudo/docker group access)"
             info "Please manually add to $daemon_json:"
-            info "  {\"insecure-registries\": [\"$HARBOR_HOST:$HARBOR_PORT\"]}"
+            info "  {\"insecure-registries\": [\"$registry_entry\"]}"
         fi
     fi
     
     if [[ "$needs_restart" == "true" ]]; then
         info "Restarting Docker daemon..."
-        sudo systemctl restart docker
-        sleep 3
-        success "Docker daemon restarted"
+        if sudo systemctl restart docker; then
+            sleep 5  # Give more time for restart
+            success "Docker daemon restarted"
+            
+            # Verify Docker is working after restart
+            if ! docker ps > /dev/null 2>&1; then
+                error "Docker daemon restart failed or not responding"
+                return 1
+            fi
+        else
+            error "Failed to restart Docker daemon"
+            return 1
+        fi
     fi
 }
 
-# Push bundles using the specified project namespace
+# Enhanced bundle pushing with better error handling and progress monitoring
 push_bundles() {
     log "Pushing NKP bundles using /$HARBOR_PROJECT namespace..."
     
@@ -479,6 +1315,21 @@ push_bundles() {
             local bundle_name=$(basename "$bundle")
             log "Pushing $bundle_name..."
             
+            # Check available disk space before pushing
+            local bundle_size_mb=$(du -m "$bundle" | cut -f1)
+            local available_mb=$(df /tmp | awk 'NR==2 {printf "%.0f", $4/1024}')
+            
+            if [[ $available_mb -lt $((bundle_size_mb * 3)) ]]; then
+                warning "Low disk space. Available: ${available_mb}MB, Need: ~$((bundle_size_mb * 3))MB"
+                info "Consider cleaning up: docker system prune -f"
+                
+                read -p "Continue with low disk space? (y/N): " input
+                if [[ ! "${input,,}" =~ ^y ]]; then
+                    error "Insufficient disk space for bundle extraction"
+                    return 1
+                fi
+            fi
+            
             local nkp_args=(
                 "push" "bundle"
                 "--bundle" "$bundle"
@@ -493,18 +1344,51 @@ push_bundles() {
                 nkp_args+=("--to-registry-insecure-skip-tls-verify")
             fi
             
-            if nkp "${nkp_args[@]}"; then
-                success "Successfully pushed: $bundle_name"
-                ((success_count++))
-                
-                # Estimate image count
-                if [[ "$bundle_name" == *"konvoy"* ]]; then
-                    total_images=$((total_images + 110))
-                elif [[ "$bundle_name" == *"kommander"* ]]; then
-                    total_images=$((total_images + 135))
+            # Execute with timeout and better error handling
+            local max_attempts=2
+            local attempt=1
+            local push_success=false
+            
+            while [[ $attempt -le $max_attempts ]] && [[ "$push_success" == "false" ]]; do
+                if [[ $attempt -gt 1 ]]; then
+                    warning "Retry attempt $attempt for $bundle_name"
+                    sleep 10
                 fi
-            else
-                error "Failed to push: $bundle_name"
+                
+                # Use timeout to prevent hanging
+                if timeout 3600 nkp "${nkp_args[@]}"; then
+                    success "Successfully pushed: $bundle_name"
+                    push_success=true
+                    ((success_count++))
+                    
+                    # Estimate image count
+                    if [[ "$bundle_name" == *"konvoy"* ]]; then
+                        total_images=$((total_images + 110))
+                    elif [[ "$bundle_name" == *"kommander"* ]]; then
+                        total_images=$((total_images + 135))
+                    fi
+                else
+                    local exit_code=$?
+                    if [[ $exit_code -eq 124 ]]; then
+                        error "Push timed out for: $bundle_name (attempt $attempt)"
+                    else
+                        error "Push failed for: $bundle_name (attempt $attempt, exit code: $exit_code)"
+                    fi
+                    
+                    # Cleanup any partial state
+                    docker system prune -f > /dev/null 2>&1 || true
+                fi
+                
+                ((attempt++))
+            done
+            
+            if [[ "$push_success" == "false" ]]; then
+                error "Failed to push $bundle_name after $max_attempts attempts"
+                info "Common issues and solutions:"
+                info "  1. Network connectivity - check Harbor accessibility"
+                info "  2. Disk space - run: docker system prune -af"
+                info "  3. Registry permissions - verify project exists and user has push access"
+                info "  4. Registry storage - check Harbor storage configuration"
                 return 1
             fi
         fi
@@ -538,8 +1422,29 @@ generate_summary() {
     echo "Username: $HARBOR_USERNAME"
     echo "Password: $HARBOR_PASSWORD"
     echo ""
+    echo "🔧 VERIFICATION COMMANDS:"
+    echo "docker login $HARBOR_HOST$([ "$HARBOR_PORT" != "80" ] && [ "$HARBOR_PORT" != "443" ] && echo ":$HARBOR_PORT") -u $HARBOR_USERNAME"
+    echo "docker pull $HARBOR_HOST$([ "$HARBOR_PORT" != "80" ] && [ "$HARBOR_PORT" != "443" ] && echo ":$HARBOR_PORT")/$HARBOR_PROJECT/mesosphere/konvoy:v$NKP_VERSION"
+    echo ""
     echo "🎉 YOUR PRIVATE REGISTRY IS READY FOR NKP DEPLOYMENT! 🎉"
 }
+
+# Enhanced error recovery and cleanup
+cleanup_on_failure() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        warning "Script failed with exit code: $exit_code"
+        info "Cleanup recommendations:"
+        info "  1. Check logs above for specific error messages"
+        info "  2. Clean Docker resources: docker system prune -af"
+        info "  3. Restart Docker if needed: sudo systemctl restart docker"
+        info "  4. Check disk space: df -h"
+        info "  5. Verify Harbor status: docker ps | grep harbor"
+    fi
+}
+
+# Set trap for cleanup
+trap cleanup_on_failure EXIT
 
 # Show usage
 show_usage() {
@@ -551,6 +1456,9 @@ show_usage() {
     echo "  --generate-config   Generate configuration file and exit"
     echo "  --verify-only       Only verify environment and connectivity"
     echo "  --push-only         Only push bundles (skip verification)"
+    echo "  --check-system      Check system requirements only"
+    echo "  --fix-docker        Attempt to fix Docker environment issues"
+    echo "  --setup-harbor      Set up Harbor environment interactively"
     echo "  --help              Show this help message"
     echo ""
     echo "Environment Variables:"
@@ -564,10 +1472,13 @@ show_usage() {
     echo "  USE_HTTPS           Use HTTPS (true/false)"
     echo ""
     echo "Examples:"
-    echo "  $0 --auto                           # Auto-detect and run"
-    echo "  $0 --config my-config.conf          # Use configuration file"
-    echo "  HARBOR_HOST=harbor.local $0 --auto  # Set host via environment"
-    echo "  $0 --generate-config                # Generate config file"
+    echo "  $0 --check-system                      # Check system requirements"
+    echo "  $0 --fix-docker                        # Fix Docker environment"
+    echo "  $0 --setup-harbor                      # Set up Harbor interactively"
+    echo "  $0 --auto                              # Auto-detect and run"
+    echo "  $0 --config my-config.conf             # Use configuration file"
+    echo "  HARBOR_HOST=harbor.local $0 --auto     # Set host via environment"
+    echo "  $0 --generate-config                   # Generate config file"
 }
 
 # Main execution
@@ -576,6 +1487,9 @@ main() {
     local verify_only=false
     local push_only=false
     local generate_config_only=false
+    local check_system_only=false
+    local fix_docker_only=false
+    local setup_harbor_only=false
     
     # Parse command line arguments
     while [[ $# -gt 0 ]]; do
@@ -600,6 +1514,18 @@ main() {
                 generate_config_only=true
                 shift
                 ;;
+            --check-system)
+                check_system_only=true
+                shift
+                ;;
+            --fix-docker)
+                fix_docker_only=true
+                shift
+                ;;
+            --setup-harbor)
+                setup_harbor_only=true
+                shift
+                ;;
             --help|-h)
                 show_usage
                 exit 0
@@ -613,6 +1539,34 @@ main() {
     done
     
     show_banner
+    
+    # Enhanced system validation with setup prompts
+    if [[ "$check_system_only" == "true" ]]; then
+        check_system_requirements
+        exit 0
+    fi
+    
+    if [[ "$fix_docker_only" == "true" ]]; then
+        validate_docker_environment
+        exit 0
+    fi
+    
+    if [[ "$setup_harbor_only" == "true" ]]; then
+        setup_harbor_environment
+        exit 0
+    fi
+    
+    # System requirements check with auto-setup
+    check_system_requirements
+    
+    # Docker environment validation with auto-setup
+    validate_docker_environment
+    
+    # Harbor environment setup with auto-detection
+    setup_harbor_environment
+    
+    # Harbor container management
+    manage_harbor_containers
     
     # Load configuration file if provided
     if [[ -n "$CONFIG_FILE" ]]; then
@@ -667,7 +1621,7 @@ main() {
     fi
     
     # Configure Docker daemon
-    configure_docker_daemon
+    configure_docker_daemon || exit 1
     
     # Push bundles
     if [[ "$push_only" != "false" ]] || [[ "$verify_only" != "true" ]]; then
@@ -678,6 +1632,9 @@ main() {
     generate_summary
     
     success "Deployment completed successfully!"
+    
+    # Clear the trap since we completed successfully
+    trap - EXIT
 }
 
 # Run main function if script is executed directly
