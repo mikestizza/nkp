@@ -1,0 +1,313 @@
+# Frontend ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: kubereats
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>KuberEats - Food Delivery</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; }
+            .header { background: #2c3e50; color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+            .container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
+            .restaurant-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 2rem; }
+            .restaurant-card { background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; cursor: pointer; transition: transform 0.2s; }
+            .restaurant-card:hover { transform: translateY(-4px); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
+            .restaurant-header { background: #34495e; color: white; padding: 1rem; }
+            .restaurant-body { padding: 1rem; }
+            .rating { color: #f39c12; }
+            .menu-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; }
+            .menu-content { background: white; margin: 5% auto; width: 90%; max-width: 600px; max-height: 80vh; overflow-y: auto; border-radius: 8px; }
+            .menu-header { background: #34495e; color: white; padding: 1rem; display: flex; justify-content: space-between; align-items: center; }
+            .menu-item { border-bottom: 1px solid #eee; padding: 1rem; display: flex; justify-content: space-between; align-items: center; }
+            .menu-item:last-child { border-bottom: none; }
+            .add-to-cart { background: #27ae60; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; }
+            .add-to-cart:hover { background: #2ecc71; }
+            .cart { position: fixed; bottom: 2rem; right: 2rem; background: #e74c3c; color: white; padding: 1rem 2rem; border-radius: 50px; box-shadow: 0 4px 16px rgba(0,0,0,0.2); cursor: pointer; }
+            .cart-count { background: white; color: #e74c3c; border-radius: 50%; padding: 0.2rem 0.5rem; margin-left: 0.5rem; }
+            .loading { text-align: center; padding: 2rem; }
+            .error { background: #e74c3c; color: white; padding: 1rem; border-radius: 4px; margin: 1rem 0; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🍕 KuberEats</h1>
+            <div>Delivering from Kubernetes to your door!</div>
+        </div>
+
+        <div class="container">
+            <h2>Available Restaurants</h2>
+            <div id="restaurants" class="restaurant-grid">
+                <div class="loading">Loading restaurants...</div>
+            </div>
+        </div>
+
+        <div id="menuModal" class="menu-modal">
+            <div class="menu-content">
+                <div class="menu-header">
+                    <h2 id="menuTitle">Menu</h2>
+                    <button onclick="closeMenu()" style="background: none; border: none; color: white; font-size: 24px; cursor: pointer;">&times;</button>
+                </div>
+                <div id="menuItems"></div>
+            </div>
+        </div>
+
+        <div class="cart" onclick="viewCart()">
+            🛒 Cart <span class="cart-count" id="cartCount">0</span>
+        </div>
+
+        <script>
+            const API_URL = '/api';
+            let sessionId = localStorage.getItem('sessionId') || generateSessionId();
+            let currentRestaurant = null;
+            let cartItems = 0;
+
+            function generateSessionId() {
+                const id = 'sess_' + Math.random().toString(36).substr(2, 9);
+                localStorage.setItem('sessionId', id);
+                return id;
+            }
+
+            async function loadRestaurants() {
+                try {
+                    const response = await fetch(`${API_URL}/restaurants`);
+                    const restaurants = await response.json();
+                    displayRestaurants(restaurants);
+                } catch (error) {
+                    document.getElementById('restaurants').innerHTML =
+                        '<div class="error">Failed to load restaurants. Please try again.</div>';
+                }
+            }
+
+            function displayRestaurants(restaurants) {
+                const container = document.getElementById('restaurants');
+                container.innerHTML = restaurants.map(restaurant => `
+                    <div class="restaurant-card" onclick="showMenu(${restaurant.id}, '${restaurant.name}')">
+                        <div class="restaurant-header">
+                            <h3>${restaurant.name}</h3>
+                            <div class="rating">★ ${restaurant.rating}</div>
+                        </div>
+                        <div class="restaurant-body">
+                            <p>${restaurant.cuisine} Cuisine</p>
+                            <p style="color: #7f8c8d; margin-top: 0.5rem;">${restaurant.address}</p>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            async function showMenu(restaurantId, restaurantName) {
+                currentRestaurant = { id: restaurantId, name: restaurantName };
+                document.getElementById('menuTitle').textContent = restaurantName + ' Menu';
+                document.getElementById('menuModal').style.display = 'block';
+
+                try {
+                    const response = await fetch(`${API_URL}/restaurants/${restaurantId}/menu`);
+                    const menuItems = await response.json();
+                    displayMenu(menuItems);
+                } catch (error) {
+                    document.getElementById('menuItems').innerHTML =
+                        '<div class="error">Failed to load menu. Please try again.</div>';
+                }
+            }
+
+            function displayMenu(items) {
+                const container = document.getElementById('menuItems');
+                container.innerHTML = items.map(item => `
+                    <div class="menu-item">
+                        <div>
+                            <h4>${item.name}</h4>
+                            <p style="color: #7f8c8d; margin: 0.5rem 0;">${item.description}</p>
+                            <p style="color: #27ae60; font-weight: bold;">$${item.price}</p>
+                        </div>
+                        <button class="add-to-cart" onclick="addToCart(${item.id}, '${item.name}', ${item.price})">
+                            Add to Cart
+                        </button>
+                    </div>
+                `).join('');
+            }
+
+            async function addToCart(itemId, itemName, price) {
+                try {
+                    // Create or get cart
+                    const cartResponse = await fetch(`${API_URL}/cart`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session_id: sessionId })
+                    });
+                    const cart = await cartResponse.json();
+
+                    // Add item to cart
+                    await fetch(`${API_URL}/cart/items`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            cart_id: cart.id,
+                            menu_item_id: itemId,
+                            quantity: 1
+                        })
+                    });
+
+                    cartItems++;
+                    document.getElementById('cartCount').textContent = cartItems;
+
+                    // Show confirmation
+                    alert(`Added ${itemName} to cart!`);
+                } catch (error) {
+                    alert('Failed to add item to cart. Please try again.');
+                }
+            }
+
+            function closeMenu() {
+                document.getElementById('menuModal').style.display = 'none';
+            }
+
+            async function viewCart() {
+                try {
+                    const response = await fetch(`${API_URL}/cart/${sessionId}`);
+                    const cart = await response.json();
+
+                    if (cart.items && cart.items.length > 0) {
+                        const total = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+                        alert(`Cart Total: $${total.toFixed(2)}\n\nItems:\n${cart.items.map(item =>
+                            `${item.name} x${item.quantity} - $${(item.price * item.quantity).toFixed(2)}`
+                        ).join('\n')}`);
+                    } else {
+                        alert('Your cart is empty!');
+                    }
+                } catch (error) {
+                    alert('Failed to load cart. Please try again.');
+                }
+            }
+
+            // Load restaurants on page load
+            loadRestaurants();
+
+            // Update cart count on load
+            async function updateCartCount() {
+                try {
+                    const response = await fetch(`${API_URL}/cart/${sessionId}`);
+                    const cart = await response.json();
+                    cartItems = cart.items ? cart.items.length : 0;
+                    document.getElementById('cartCount').textContent = cartItems;
+                } catch (error) {
+                    console.error('Failed to update cart count');
+                }
+            }
+            updateCartCount();
+        </script>
+    </body>
+    </html>
+
+  nginx.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        location / {
+            root /usr/share/nginx/html;
+            try_files $uri /index.html;
+        }
+
+        location /api/ {
+            proxy_pass http://backend-api:3000/api/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_cache_bypass $http_upgrade;
+        }
+
+        location /health {
+            return 200 'healthy\n';
+        }
+    }
+
+---
+# Frontend Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: kubereats
+  labels:
+    app: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        version: v1
+    spec:
+      containers:
+      - name: frontend
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+          name: http
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d
+      volumes:
+      - name: html
+        configMap:
+          name: frontend-config
+          items:
+          - key: index.html
+            path: index.html
+      - name: nginx-config
+        configMap:
+          name: frontend-config
+          items:
+          - key: nginx.conf
+            path: default.conf
+
+---
+# Frontend Service with LoadBalancer
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: kubereats
+  labels:
+    app: frontend
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: frontend
