@@ -1,0 +1,274 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-api
+  namespace: kubereats
+  labels:
+    app: backend-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend-api
+  template:
+    metadata:
+      labels:
+        app: backend-api
+        version: v1
+    spec:
+      containers:
+      - name: backend
+        image: node:18-alpine
+        workingDir: /app
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            # Create package.json
+            cat > package.json << 'EOF'
+            {
+              "name": "kubereats-backend",
+              "version": "1.0.0",
+              "main": "server.js",
+              "dependencies": {
+                "express": "^4.18.2",
+                "pg": "^8.11.3"
+              }
+            }
+            EOF
+
+            # Create server.js
+            cat > server.js << 'EOF'
+            const express = require('express');
+            const { Pool } = require('pg');
+            const app = express();
+            const PORT = process.env.PORT || 3000;
+
+            // Middleware
+            app.use(express.json());
+            app.use((req, res, next) => {
+              res.header("Access-Control-Allow-Origin", "*");
+              res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+              next();
+            });
+
+            // PostgreSQL connection with retry logic
+            let pool;
+            let retries = 0;
+            const maxRetries = 30;
+
+            async function connectDB() {
+              try {
+                pool = new Pool({
+                  host: process.env.DB_HOST || 'postgres',
+                  port: process.env.DB_PORT || 5432,
+                  user: process.env.DB_USER,
+                  password: process.env.DB_PASSWORD,
+                  database: process.env.DB_NAME
+                });
+
+                await pool.query('SELECT 1');
+                console.log('Connected to PostgreSQL');
+              } catch (err) {
+                retries++;
+                console.log(`Failed to connect to DB (attempt ${retries}/${maxRetries}):`, err.message);
+                if (retries < maxRetries) {
+                  setTimeout(connectDB, 2000);
+                } else {
+                  console.error('Max retries reached. Exiting.');
+                  process.exit(1);
+                }
+              }
+            }
+
+            // Start DB connection
+            connectDB();
+
+            // Health check
+            app.get('/health', async (req, res) => {
+              if (!pool) {
+                return res.status(503).json({ status: 'unhealthy', reason: 'DB not connected' });
+              }
+              try {
+                await pool.query('SELECT 1');
+                res.json({ status: 'healthy' });
+              } catch (err) {
+                res.status(500).json({ status: 'unhealthy', error: err.message });
+              }
+            });
+
+            // Get all restaurants
+            app.get('/api/restaurants', async (req, res) => {
+              if (!pool) {
+                return res.status(503).json({ error: 'Service unavailable' });
+              }
+              try {
+                const result = await pool.query('SELECT * FROM restaurants ORDER BY rating DESC');
+                res.json(result.rows);
+              } catch (err) {
+                res.status(500).json({ error: err.message });
+              }
+            });
+
+            // Get menu items
+            app.get('/api/restaurants/:id/menu', async (req, res) => {
+              if (!pool) {
+                return res.status(503).json({ error: 'Service unavailable' });
+              }
+              try {
+                const { id } = req.params;
+                const result = await pool.query(
+                  'SELECT * FROM menu_items WHERE restaurant_id = $1 AND available = true',
+                  [id]
+                );
+                res.json(result.rows);
+              } catch (err) {
+                res.status(500).json({ error: err.message });
+              }
+            });
+
+            // Create/update cart
+            app.post('/api/cart', async (req, res) => {
+              if (!pool) {
+                return res.status(503).json({ error: 'Service unavailable' });
+              }
+              const { session_id } = req.body;
+              try {
+                const result = await pool.query(
+                  'INSERT INTO carts (session_id) VALUES ($1) ON CONFLICT (session_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP RETURNING *',
+                  [session_id]
+                );
+                res.json(result.rows[0]);
+              } catch (err) {
+                res.status(500).json({ error: err.message });
+              }
+            });
+
+            // Add item to cart
+            app.post('/api/cart/items', async (req, res) => {
+              if (!pool) {
+                return res.status(503).json({ error: 'Service unavailable' });
+              }
+              const { cart_id, menu_item_id, quantity = 1 } = req.body;
+              try {
+                const result = await pool.query(
+                  'INSERT INTO cart_items (cart_id, menu_item_id, quantity) VALUES ($1, $2, $3) RETURNING *',
+                  [cart_id, menu_item_id, quantity]
+                );
+                res.json(result.rows[0]);
+              } catch (err) {
+                res.status(500).json({ error: err.message });
+              }
+            });
+
+            // Get cart items
+            app.get('/api/cart/:session_id', async (req, res) => {
+              if (!pool) {
+                return res.status(503).json({ error: 'Service unavailable' });
+              }
+              const { session_id } = req.params;
+              try {
+                const cartResult = await pool.query('SELECT * FROM carts WHERE session_id = $1', [session_id]);
+
+                if (cartResult.rows.length === 0) {
+                  return res.json({ items: [] });
+                }
+
+                const cart = cartResult.rows[0];
+                const itemsResult = await pool.query(
+                  `SELECT ci.*, mi.name, mi.price, r.name as restaurant_name
+                   FROM cart_items ci
+                   JOIN menu_items mi ON ci.menu_item_id = mi.id
+                   JOIN restaurants r ON mi.restaurant_id = r.id
+                   WHERE ci.cart_id = $1`,
+                  [cart.id]
+                );
+
+                res.json({
+                  cart_id: cart.id,
+                  session_id: cart.session_id,
+                  items: itemsResult.rows
+                });
+              } catch (err) {
+                res.status(500).json({ error: err.message });
+              }
+            });
+
+            app.listen(PORT, () => {
+              console.log(`Server running on port ${PORT}`);
+            });
+            EOF
+
+            # Install dependencies
+            echo "Installing dependencies..."
+            npm install --production
+
+            # Start the server
+            echo "Starting server..."
+            node server.js
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: DB_HOST
+          value: "postgres"
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_USER
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_PASSWORD
+        - name: DB_NAME
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_DB
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 60
+          periodSeconds: 5
+          failureThreshold: 5
+
+---
+# Backend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-api
+  namespace: kubereats
+  labels:
+    app: backend-api
+spec:
+  type: ClusterIP
+  ports:
+  - port: 3000
+    targetPort: 3000
+    protocol: TCP
+    name: http
+  selector:
+    app: backend-api

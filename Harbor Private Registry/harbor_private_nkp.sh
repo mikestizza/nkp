@@ -1,5 +1,5 @@
 #!/bin/bash
-# Enhanced Portable NKP Harbor Deployment Script with Problem Detection & Resolution
+#Portable NKP Harbor Deployment Script 
 
 set -e
 
