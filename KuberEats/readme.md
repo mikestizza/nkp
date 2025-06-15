@@ -16,7 +16,7 @@ The application consists of three main components:
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌──────────────┐
-│   Frontend  │────▶│ Backend API │────▶│  PostgreSQL  │
+│   Frontend  │────▶│ Backend API │───▶│  PostgreSQL  │
 │   (Nginx)   │     │  (Node.js)  │     │   Database   │
 └─────────────┘     └─────────────┘     └──────────────┘
 ```
