@@ -1,12 +1,12 @@
-# KuberEats 🍕
+# KuberEats
 
 A cloud-native food delivery demo application built for Kubernetes.
 
-## 🎯 Overview
+## Overview
 
 KuberEats is a microservices-based food delivery application designed to demonstrate Kubernetes deployment patterns, container orchestration, and cloud-native best practices. Perfect for demos, workshops, and learning Kubernetes concepts.
 
-## 🏗️ Architecture
+## Architecture
 
 The application consists of three main components:
 
@@ -21,7 +21,7 @@ The application consists of three main components:
 └─────────────┘     └─────────────┘     └──────────────┘
 ```
 
-## ✨ Features
+## Features
 
 - Browse restaurants and menus
 - Add items to cart
@@ -32,7 +32,7 @@ The application consists of three main components:
 - Health checks and readiness probes
 - Horizontal pod autoscaling ready
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -71,7 +71,7 @@ The application consists of three main components:
    
    Then open http://localhost:8080 in your browser.
 
-## 🔧 Configuration
+## Configuration
 
 ### Environment Variables
 
@@ -89,7 +89,7 @@ PostgreSQL uses a PersistentVolumeClaim. Modify the storage class in `postgres-d
 storageClassName: your-storage-class
 ```
 
-## 📊 Monitoring
+## Monitoring
 
 Each component includes health checks:
 
@@ -97,7 +97,7 @@ Each component includes health checks:
 - **Backend**: `/health`
 - **Database**: PostgreSQL readiness probe
 
-## 🛠️ Development
+## Development
 
 ### Local Development
 
@@ -114,7 +114,7 @@ For local development without Kubernetes:
 - Update the UI in the frontend ConfigMap
 - Add new API endpoints in the backend deployment
 
-## 📦 Components Detail
+## Components Detail
 
 ### Frontend
 - Single-page application
@@ -134,11 +134,11 @@ For local development without Kubernetes:
 - Sample data preloaded
 - Backup CronJob (optional)
 
-## 🤝 Contributing
+## Contributing
 
 This is a demo application intended for learning and demonstration purposes. Feel free to fork and modify for your own use cases.
 
-## ⚠️ Production Considerations
+## Production Considerations
 
 This demo app is NOT production-ready. For production use, consider:
 - Implementing proper authentication/authorization
@@ -149,11 +149,11 @@ This demo app is NOT production-ready. For production use, consider:
 - Adding input validation and sanitization
 - Implementing proper secret management
 
-## 📄 License
+## License
 
 This demo application is open source and available under the MIT License.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 Built as a demonstration of Kubernetes capabilities and cloud-native application design patterns.
 
