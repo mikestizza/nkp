@@ -54,7 +54,7 @@ data:
     (2, 'Crispy Fries', 'Hand-cut fries with sea salt', 3.99, 'Sides'),
     (3, 'California Roll', 'Crab, avocado, and cucumber', 8.99, 'Rolls'),
     (3, 'Salmon Sashimi', 'Fresh Atlantic salmon (5 pieces)', 12.99, 'Sashimi');
-    
+
 ---
 # PostgreSQL PVC using Nutanix
 apiVersion: v1
@@ -71,7 +71,7 @@ spec:
       storage: 20Gi
 
 ---
-# PostgreSQL StatefulSet (better than Deployment for databases)
+# PostgreSQL StatefulSet
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

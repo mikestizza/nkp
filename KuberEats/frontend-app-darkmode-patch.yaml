@@ -1,8 +1,8 @@
-# Frontend ConfigMap with Dark Mode
+# Frontend ConfigMap v2 with Dark Mode
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: frontend-config
+  name: frontend-config-v2
   namespace: kubereats
 data:
   index.html: |
@@ -281,6 +281,16 @@ data:
             [data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
                 background: var(--text-secondary);
             }
+
+            /* Version info */
+            .version-info {
+                position: fixed;
+                bottom: 10px;
+                left: 10px;
+                font-size: 10px;
+                color: var(--text-secondary);
+                opacity: 0.5;
+            }
         </style>
     </head>
     <body>
@@ -315,11 +325,17 @@ data:
             🛒 Cart <span class="cart-count" id="cartCount">0</span>
         </div>
 
+        <div class="version-info">v2.0.0</div>
+
         <script>
             const API_URL = '/api';
+            const APP_VERSION = 'v2.0.0';
             let sessionId = localStorage.getItem('sessionId') || generateSessionId();
             let currentRestaurant = null;
             let cartItems = 0;
+
+            // Log version on load
+            console.log(`KuberEats Frontend ${APP_VERSION} - Dark Mode Enabled`);
 
             // Dark mode functionality
             function initTheme() {
@@ -519,10 +535,14 @@ data:
         location /health {
             return 200 'healthy\n';
         }
+
+        location /version {
+            return 200 'v2.0.0\n';
+        }
     }
 
 ---
-# Frontend Deployment
+# Frontend Deployment with Versioning
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -530,8 +550,12 @@ metadata:
   namespace: kubereats
   labels:
     app: frontend
+    version: v2.0.0
+  annotations:
+    kubernetes.io/change-cause: "Deploy v2.0.0 with dark mode support"
 spec:
   replicas: 2
+  revisionHistoryLimit: 5  # Keep last 5 revisions for rollback
   selector:
     matchLabels:
       app: frontend
@@ -539,7 +563,11 @@ spec:
     metadata:
       labels:
         app: frontend
-        version: v1
+        version: v2.0.0
+      annotations:
+        checksum/config: "{{ include (print $.Template.BasePath \"/configmap.yaml\") . | sha256sum }}"
+        deployed-at: "{{ now | date \"2006-01-02T15:04:05Z07:00\" }}"
+        feature: "dark-mode"
     spec:
       containers:
       - name: frontend
@@ -547,6 +575,11 @@ spec:
         ports:
         - containerPort: 80
           name: http
+        env:
+        - name: APP_VERSION
+          value: "v2.0.0"
+        - name: CONFIG_VERSION
+          value: "v2"
         resources:
           requests:
             memory: "64Mi"
@@ -574,19 +607,19 @@ spec:
       volumes:
       - name: html
         configMap:
-          name: frontend-config
+          name: frontend-config-v2  # Note: Using versioned ConfigMap
           items:
           - key: index.html
             path: index.html
       - name: nginx-config
         configMap:
-          name: frontend-config
+          name: frontend-config-v2  # Note: Using versioned ConfigMap
           items:
           - key: nginx.conf
             path: default.conf
 
 ---
-# Frontend Service with LoadBalancer
+# Frontend Service (unchanged)
 apiVersion: v1
 kind: Service
 metadata:
