@@ -1,0 +1,416 @@
+# Frontend ConfigMap v1.2.0 - Simplified without dark mode
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: kubereats
+  labels:
+    app: frontend
+    version: v1.2.0
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>KuberEats - Food Delivery</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; }
+            .header { background: #2c3e50; color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+            .header-links { display: flex; gap: 1.5rem; align-items: center; }
+            .header-links a { color: white; text-decoration: none; font-size: 0.9rem; }
+            .header-links a:hover { opacity: 0.8; }
+            .container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
+            .restaurant-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 2rem; }
+            .restaurant-card { background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; cursor: pointer; transition: transform 0.2s; }
+            .restaurant-card:hover { transform: translateY(-4px); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
+            .restaurant-header { background: #34495e; color: white; padding: 1rem; }
+            .restaurant-body { padding: 1rem; }
+            .rating { color: #f39c12; }
+            .menu-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; }
+            .menu-content { background: white; margin: 5% auto; width: 90%; max-width: 600px; max-height: 80vh; overflow-y: auto; border-radius: 8px; }
+            .menu-header { background: #34495e; color: white; padding: 1rem; display: flex; justify-content: space-between; align-items: center; }
+            .menu-item { border-bottom: 1px solid #eee; padding: 1rem; display: flex; justify-content: space-between; align-items: center; }
+            .menu-item:last-child { border-bottom: none; }
+            .add-to-cart { background: #27ae60; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; }
+            .add-to-cart:hover { background: #2ecc71; }
+            .cart { position: fixed; bottom: 2rem; right: 2rem; background: #e74c3c; color: white; padding: 1rem 2rem; border-radius: 50px; box-shadow: 0 4px 16px rgba(0,0,0,0.2); cursor: pointer; }
+            .cart-count { background: white; color: #e74c3c; border-radius: 50%; padding: 0.2rem 0.5rem; margin-left: 0.5rem; }
+            .loading { text-align: center; padding: 2rem; }
+            .error { background: #e74c3c; color: white; padding: 1rem; border-radius: 4px; margin: 1rem 0; }
+            .version-info { position: fixed; bottom: 10px; left: 10px; font-size: 10px; color: #999; opacity: 0.5; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🍕 KuberEats</h1>
+            <div class="header-links">
+                <span>Delivering from Kubernetes to your door!</span>
+                <a href="/architecture.html">📊 Architecture</a>
+            </div>
+        </div>
+
+        <div class="container">
+            <h2>Available Restaurants</h2>
+            <div id="restaurants" class="restaurant-grid">
+                <div class="loading">Loading restaurants...</div>
+            </div>
+        </div>
+
+        <div id="menuModal" class="menu-modal">
+            <div class="menu-content">
+                <div class="menu-header">
+                    <h2 id="menuTitle">Menu</h2>
+                    <button onclick="closeMenu()" style="background: none; border: none; color: white; font-size: 24px; cursor: pointer;">&times;</button>
+                </div>
+                <div id="menuItems"></div>
+            </div>
+        </div>
+
+        <div class="cart" onclick="viewCart()">
+            🛒 Cart <span class="cart-count" id="cartCount">0</span>
+        </div>
+
+        <div class="version-info">v1.2.0</div>
+
+        <script>
+            const API_URL = '/api';
+            const APP_VERSION = 'v1.2.0';
+            let sessionId = localStorage.getItem('sessionId') || generateSessionId();
+            let currentRestaurant = null;
+            let cartItems = 0;
+
+            console.log(`KuberEats Frontend ${APP_VERSION}`);
+
+            function generateSessionId() {
+                const id = 'sess_' + Math.random().toString(36).substr(2, 9);
+                localStorage.setItem('sessionId', id);
+                return id;
+            }
+
+            async function loadRestaurants() {
+                try {
+                    const response = await fetch(`${API_URL}/restaurants`);
+                    const restaurants = await response.json();
+                    displayRestaurants(restaurants);
+                } catch (error) {
+                    document.getElementById('restaurants').innerHTML =
+                        '<div class="error">Failed to load restaurants. Please try again.</div>';
+                }
+            }
+
+            function displayRestaurants(restaurants) {
+                const container = document.getElementById('restaurants');
+                container.innerHTML = restaurants.map(restaurant => `
+                    <div class="restaurant-card" onclick="showMenu(${restaurant.id}, '${restaurant.name}')">
+                        <div class="restaurant-header">
+                            <h3>${restaurant.name}</h3>
+                            <div class="rating">★ ${restaurant.rating}</div>
+                        </div>
+                        <div class="restaurant-body">
+                            <p>${restaurant.cuisine} Cuisine</p>
+                            <p style="color: #7f8c8d; margin-top: 0.5rem;">${restaurant.address}</p>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            async function showMenu(restaurantId, restaurantName) {
+                currentRestaurant = { id: restaurantId, name: restaurantName };
+                document.getElementById('menuTitle').textContent = restaurantName + ' Menu';
+                document.getElementById('menuModal').style.display = 'block';
+
+                try {
+                    const response = await fetch(`${API_URL}/restaurants/${restaurantId}/menu`);
+                    const menuItems = await response.json();
+                    displayMenu(menuItems);
+                } catch (error) {
+                    document.getElementById('menuItems').innerHTML =
+                        '<div class="error">Failed to load menu. Please try again.</div>';
+                }
+            }
+
+            function displayMenu(items) {
+                const container = document.getElementById('menuItems');
+                container.innerHTML = items.map(item => `
+                    <div class="menu-item">
+                        <div>
+                            <h4>${item.name}</h4>
+                            <p style="color: #7f8c8d; margin: 0.5rem 0;">${item.description}</p>
+                            <p style="color: #27ae60; font-weight: bold;">$${item.price}</p>
+                        </div>
+                        <button class="add-to-cart" onclick="addToCart(${item.id}, '${item.name}', ${item.price})">
+                            Add to Cart
+                        </button>
+                    </div>
+                `).join('');
+            }
+
+            async function addToCart(itemId, itemName, price) {
+                try {
+                    const cartResponse = await fetch(`${API_URL}/cart`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session_id: sessionId })
+                    });
+                    const cart = await cartResponse.json();
+
+                    await fetch(`${API_URL}/cart/items`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            cart_id: cart.id,
+                            menu_item_id: itemId,
+                            quantity: 1
+                        })
+                    });
+
+                    cartItems++;
+                    document.getElementById('cartCount').textContent = cartItems;
+                    alert(`Added ${itemName} to cart!`);
+                } catch (error) {
+                    alert('Failed to add item to cart. Please try again.');
+                }
+            }
+
+            function closeMenu() {
+                document.getElementById('menuModal').style.display = 'none';
+            }
+
+            async function viewCart() {
+                try {
+                    const response = await fetch(`${API_URL}/cart/${sessionId}`);
+                    const cart = await response.json();
+
+                    if (cart.items && cart.items.length > 0) {
+                        const total = cart.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+                        alert(`Cart Total: $${total.toFixed(2)}\n\nItems:\n${cart.items.map(item =>
+                            `${item.name} x${item.quantity} - $${(item.price * item.quantity).toFixed(2)}`
+                        ).join('\n')}`);
+                    } else {
+                        alert('Your cart is empty!');
+                    }
+                } catch (error) {
+                    alert('Failed to load cart. Please try again.');
+                }
+            }
+
+            window.onclick = function(event) {
+                const modal = document.getElementById('menuModal');
+                if (event.target == modal) {
+                    closeMenu();
+                }
+            }
+
+            loadRestaurants();
+
+            async function updateCartCount() {
+                try {
+                    const response = await fetch(`${API_URL}/cart/${sessionId}`);
+                    const cart = await response.json();
+                    cartItems = cart.items ? cart.items.length : 0;
+                    document.getElementById('cartCount').textContent = cartItems;
+                } catch (error) {
+                    console.error('Failed to update cart count');
+                }
+            }
+            updateCartCount();
+        </script>
+    </body>
+    </html>
+
+  architecture.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>KuberEats - System Architecture</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #2c3e50; }
+            .header { background: #2c3e50; color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+            .nav-links { display: flex; gap: 2rem; align-items: center; }
+            .nav-links a { color: white; text-decoration: none; font-size: 0.9rem; }
+            .nav-links a:hover { opacity: 0.8; }
+            .container { max-width: 1400px; margin: 2rem auto; padding: 0 1rem; }
+            .intro-section { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 2rem; }
+            .intro-section h2 { margin-bottom: 1rem; }
+            .intro-section p { line-height: 1.6; margin-bottom: 0.5rem; }
+            .architecture-diagram { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 2rem; text-align: center; }
+            .architecture-diagram h2 { margin-bottom: 1.5rem; }
+            .architecture-image { max-width: 100%; height: auto; margin: 0 auto; display: block; }
+            .components-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin-top: 2rem; }
+            .component-card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 1.5rem; transition: transform 0.2s, box-shadow 0.2s; }
+            .component-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+            .component-card h3 { color: #3498db; margin-bottom: 0.75rem; }
+            .component-card ul { list-style: none; padding-left: 0; }
+            .component-card li { padding: 0.25rem 0; font-size: 0.9rem; }
+            .component-card li:before { content: "• "; color: #3498db; font-weight: bold; margin-right: 0.5rem; }
+            .tech-stack { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; }
+            .tech-badge { background: #3498db; color: white; padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.8rem; }
+            .version-info { position: fixed; bottom: 10px; right: 10px; font-size: 10px; color: #999; opacity: 0.5; }
+            code { background: #f4f4f4; padding: 0.2rem 0.4rem; border-radius: 3px; font-size: 0.9rem; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🍕 KuberEats Architecture</h1>
+            <div class="nav-links">
+                <a href="/">← Back to App</a>
+                <a href="#overview">Overview</a>
+                <a href="#diagram">Diagram</a>
+                <a href="#components">Components</a>
+            </div>
+        </div>
+
+        <div class="container">
+            <div class="intro-section" id="overview">
+                <h2>System Architecture Overview</h2>
+                <p>KuberEats is a cloud-native food delivery platform built on Kubernetes. The application follows a microservices architecture with three main tiers:</p>
+                <ul style="margin-left: 2rem; margin-top: 1rem;">
+                    <li><strong>Frontend Layer:</strong> Nginx-based web interface serving a single-page application</li>
+                    <li><strong>Backend API Layer:</strong> Node.js/Express.js RESTful API handling business logic</li>
+                    <li><strong>Database Layer:</strong> PostgreSQL for persistent data storage</li>
+                </ul>
+                <p style="margin-top: 1rem;">All components run in the <code>kubereats</code> namespace and leverage Kubernetes features like health probes, resource limits, and persistent storage.</p>
+            </div>
+
+            <div class="architecture-diagram" id="diagram">
+                <h2>System Architecture Diagram</h2>
+                <img src="data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgMTAwMCA4MDAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CiAgPHJlY3Qgd2lkdGg9IjEwMDAiIGhlaWdodD0iODAwIiBmaWxsPSIjZjhmOWZhIi8+CiAgCiAgPHRleHQgeD0iNTAwIiB5PSIzMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIyNCIgZm9udC13ZWlnaHQ9ImJvbGQiPkt1YmVyRWF0cyBBcmNoaXRlY3R1cmU8L3RleHQ+CiAgCiAgPCEtLSBVc2VyIC0tPgogIDxyZWN0IHg9IjQwMCIgeT0iNjAiIHdpZHRoPSIyMDAiIGhlaWdodD0iNjAiIGZpbGw9IiNlM2YyZmQiIHN0cm9rZT0iIzE5NzZkMiIgc3Ryb2tlLXdpZHRoPSIyIiByeD0iOCIvPgogIDx0ZXh0IHg9IjUwMCIgeT0iOTUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTQiIGZvbnQtd2VpZ2h0PSJib2xkIj5Vc2VyIEJyb3dzZXI8L3RleHQ+CiAgCiAgPCEtLSBBcnJvdyAtLT4KICA8bGluZSB4MT0iNTAwIiB5MT0iMTIwIiB4Mj0iNTAwIiB5Mj0iMTUwIiBzdHJva2U9IiM0Q0FGNTAiIHN0cm9rZS13aWR0aD0iMiIgbWFya2VyLWVuZD0idXJsKCNhcnJvd2hlYWQpIi8+CiAgCiAgPCEtLSBLOHMgQ2x1c3RlciAtLT4KICA8cmVjdCB4PSI1MCIgeT0iMTYwIiB3aWR0aD0iOTAwIiBoZWlnaHQ9IjYwMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNjY2IiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1kYXNoYXJyYXk9IjgsNCIgcng9IjEwIi8+CiAgPHRleHQgeD0iNzAiIHk9IjE4NSIgZm9udC1zaXplPSIxNiIgZmlsbD0iIzY2NiI+S3ViZXJuZXRlcyBDbHVzdGVyIChrdWJlcmVhdHMgbmFtZXNwYWNlKTwvdGV4dD4KICAKICA8IS0tIEZyb250ZW5kIC0tPgogIDxyZWN0IHg9IjEwMCIgeT0iMjEwIiB3aWR0aD0iODAwIiBoZWlnaHQ9IjE1MCIgZmlsbD0iI2U4ZjVlOSIgc3Ryb2tlPSIjNGNhZjUwIiBzdHJva2Utd2lkdGg9IjIiIHJ4PSI4Ii8+CiAgPHRleHQgeD0iNTAwIiB5PSIyMzUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSJib2xkIj5Gcm9udGVuZCBMYXllcjwvdGV4dD4KICA8cmVjdCB4PSIxNTAiIHk9IjI1MCIgd2lkdGg9IjMwMCIgaGVpZ2h0PSI5MCIgZmlsbD0iIzY2YmI2YSIgcng9IjUiLz4KICA8dGV4dCB4PSIzMDAiIHk9IjI3NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxNCIgZmlsbD0id2hpdGUiPkxvYWRCYWxhbmNlciBTZXJ2aWNlPC90ZXh0PgogIDx0ZXh0IHg9IjMwMCIgeT0iMjk1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEyIiBmaWxsPSJ3aGl0ZSI+Mnggbmdpbng6YWxwaW5lIHBvZHM8L3RleHQ+CiAgPHRleHQgeD0iMzAwIiB5PSIzMTUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IndoaXRlIj5IVE1ML0NTUy9KUyAoQ29uZmlnTWFwKTwvdGV4dD4KICAKICA8cmVjdCB4PSI1NTAiIHk9IjI1MCIgd2lkdGg9IjMwMCIgaGVpZ2h0PSI5MCIgZmlsbD0iIzY2YmI2YSIgcng9IjUiLz4KICA8dGV4dCB4PSI3MDAiIHk9IjI4MCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMiIgZmlsbD0id2hpdGUiPlJlc291cmNlIExpbWl0czo8L3RleHQ+CiAgPHRleHQgeD0iNzAwIiB5PSIzMDAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IndoaXRlIj5DUFU6IDUwbS0xMDBtPC90ZXh0PgogIDx0ZXh0IHg9IjcwMCIgeT0iMzIwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjExIiBmaWxsPSJ3aGl0ZSI+TWVtb3J5OiA2NE1pLTEyOE1pPC90ZXh0PgogIAogIDwhLS0gQXJyb3cgLS0+CiAgPGxpbmUgeDE9IjUwMCIgeTE9IjM2MCIgeDI9IjUwMCIgeTI9IjM5MCIgc3Ryb2tlPSIjNENBRjUwIiBzdHJva2Utd2lkdGg9IjIiIG1hcmtlci1lbmQ9InVybCgjYXJyb3doZWFkKSIvPgogIAogIDwhLS0gQmFja2VuZCAtLT4KICA8cmVjdCB4PSIxMDAiIHk9IjQwMCIgd2lkdGg9IjgwMCIgaGVpZ2h0PSIxNTAiIGZpbGw9IiNmZmYzZTAiIHN0cm9rZT0iI2ZmOTgwMCIgc3Ryb2tlLXdpZHRoPSIyIiByeD0iOCIvPgogIDx0ZXh0IHg9IjUwMCIgeT0iNDI1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iYm9sZCI+QmFja2VuZCBBUEkgTGF5ZXI8L3RleHQ+CiAgPHJlY3QgeD0iMTUwIiB5PSI0NDAiIHdpZHRoPSIzMDAiIGhlaWdodD0iOTAiIGZpbGw9IiNmZmE3MjYiIHJ4PSI1Ii8+CiAgPHRleHQgeD0iMzAwIiB5PSI0NjUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IndoaXRlIj5DbHVzdGVySVAgU2VydmljZTwvdGV4dD4KICA8dGV4dCB4PSIzMDAiIHk9IjQ4NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMiIgZmlsbD0id2hpdGUiPjJ4IG5vZGU6MTgtYWxwaW5lIHBvZHM8L3RleHQ+CiAgPHRleHQgeD0iMzAwIiB5PSI1MDUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IndoaXRlIj5FeHByZXNzLmpzIFJFU1QgQVBJPC90ZXh0PgogIAogIDxyZWN0IHg9IjU1MCIgeT0iNDQwIiB3aWR0aD0iMzAwIiBoZWlnaHQ9IjkwIiBmaWxsPSIjZmZhNzI2IiByeD0iNSIvPgogIDx0ZXh0IHg9IjcwMCIgeT0iNDcwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEyIiBmaWxsPSJ3aGl0ZSI+UmVzb3VyY2UgTGltaXRzOjwvdGV4dD4KICA8dGV4dCB4PSI3MDAiIHk9IjQ5MCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxMSIgZmlsbD0id2hpdGUiPkNQVTogMjAwbS01MDBtPC90ZXh0PgogIDx0ZXh0IHg9IjcwMCIgeT0iNTEwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjExIiBmaWxsPSJ3aGl0ZSI+TWVtb3J5OiAyNTZNaS01MTJNaTwvdGV4dD4KICAKICA8IS0tIEFycm93IC0tPgogIDxsaW5lIHgxPSI1MDAiIHkxPSI1NTAiIHgyPSI1MDAiIHkyPSI1ODAiIHN0cm9rZT0iIzRDQUY1MCIgc3Ryb2tlLXdpZHRoPSIyIiBtYXJrZXItZW5kPSJ1cmwoI2Fycm93aGVhZCkiLz4KICAKICA8IS0tIERhdGFiYXNlIC0tPgogIDxyZWN0IHg9IjEwMCIgeT0iNTkwIiB3aWR0aD0iODAwIiBoZWlnaHQ9IjE1MCIgZmlsbD0iI2UzZjJmZCIgc3Ryb2tlPSIjMTk3NmQyIiBzdHJva2Utd2lkdGg9IjIiIHJ4PSI4Ii8+CiAgPHRleHQgeD0iNTAwIiB5PSI2MTUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSJib2xkIj5EYXRhYmFzZSBMYXllcjwvdGV4dD4KICA8cmVjdCB4PSIxNTAiIHk9IjYzMCIgd2lkdGg9IjMwMCIgaGVpZ2h0PSI5MCIgZmlsbD0iIzQyYTVmNSIgcng9IjUiLz4KICA8dGV4dCB4PSIzMDAiIHk9IjY1NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1zaXplPSIxNCIgZmlsbD0id2hpdGUiPlBvc3RncmVTUUwgU3RhdGVmdWxTZXQ8L3RleHQ+CiAgPHRleHQgeD0iMzAwIiB5PSI2NzUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTIiIGZpbGw9IndoaXRlIj4xeCBwb3N0Z3JlczoxNS1hbHBpbmU8L3RleHQ+CiAgPHRleHQgeD0iMzAwIiB5PSI2OTUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IndoaXRlIj4yMEdCIFBlcnNpc3RlbnQgVm9sdW1lPC90ZXh0PgogIAogIDxyZWN0IHg9IjU1MCIgeT0iNjMwIiB3aWR0aD0iMzAwIiBoZWlnaHQ9IjkwIiBmaWxsPSIjNDJhNWY1IiByeD0iNSIvPgogIDx0ZXh0IHg9IjcwMCIgeT0iNjU1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEyIiBmaWxsPSJ3aGl0ZSI+QmFja3VwIENyb25Kb2I8L3RleHQ+CiAgPHRleHQgeD0iNzAwIiB5PSI2NzUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IndoaXRlIj5EYWlseSBhdCAyIEFNPC90ZXh0PgogIDx0ZXh0IHg9IjcwMCIgeT0iNjk1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjExIiBmaWxsPSJ3aGl0ZSI+Ny1kYXkgcmV0ZW50aW9uPC90ZXh0PgogIAogIDwhLS0gQXJyb3cgbWFya2VyIC0tPgogIDxkZWZzPgogICAgPG1hcmtlciBpZD0iYXJyb3doZWFkIiBtYXJrZXJXaWR0aD0iMTAiIG1hcmtlckhlaWdodD0iNyIgcmVmWD0iOSIgcmVmWT0iMy41IiBvcmllbnQ9ImF1dG8iPgogICAgICA8cG9seWdvbiBwb2ludHM9IjAgMCwgMTAgMy41LCAwIDciIGZpbGw9IiM0Q0FGNTAiLz4KICAgIDwvbWFya2VyPgogIDwvZGVmcz4KPC9zdmc+" 
+                     alt="KuberEats Architecture Diagram" 
+                     class="architecture-image" />
+            </div>
+
+            <div id="components">
+                <h2 style="margin-bottom: 1.5rem;">Component Details</h2>
+                <div class="components-grid">
+                    <div class="component-card">
+                        <h3>🌐 Frontend Service</h3>
+                        <ul>
+                            <li>LoadBalancer type for external access</li>
+                            <li>2 replicas for high availability</li>
+                            <li>Nginx reverse proxy to backend API</li>
+                            <li>Single-page application (vanilla JS)</li>
+                            <li>Health checks on /health endpoint</li>
+                        </ul>
+                        <div class="tech-stack">
+                            <span class="tech-badge">nginx:alpine</span>
+                            <span class="tech-badge">HTML/CSS/JS</span>
+                        </div>
+                    </div>
+
+                    <div class="component-card">
+                        <h3>⚙️ Backend API</h3>
+                        <ul>
+                            <li>RESTful API with Express.js</li>
+                            <li>ClusterIP service (internal only)</li>
+                            <li>Database connection with retry logic</li>
+                            <li>Environment variables from K8s secrets</li>
+                            <li>Horizontal scaling with 2 replicas</li>
+                        </ul>
+                        <div class="tech-stack">
+                            <span class="tech-badge">node:18-alpine</span>
+                            <span class="tech-badge">Express.js</span>
+                            <span class="tech-badge">PostgreSQL driver</span>
+                        </div>
+                    </div>
+
+                    <div class="component-card">
+                        <h3>🗄️ Database</h3>
+                        <ul>
+                            <li>PostgreSQL 15 with Alpine Linux</li>
+                            <li>StatefulSet for stable identity</li>
+                            <li>Persistent volume claim (20GB)</li>
+                            <li>Automated nightly backups</li>
+                            <li>Init script for schema setup</li>
+                        </ul>
+                        <div class="tech-stack">
+                            <span class="tech-badge">postgres:15-alpine</span>
+                            <span class="tech-badge">Nutanix Storage</span>
+                        </div>
+                    </div>
+
+                    <div class="component-card">
+                        <h3>🔐 Configuration</h3>
+                        <ul>
+                            <li>ConfigMaps for frontend files</li>
+                            <li>Secrets for database credentials</li>
+                            <li>Resource quotas and limits</li>
+                            <li>Liveness and readiness probes</li>
+                            <li>Namespace isolation</li>
+                        </ul>
+                        <div class="tech-stack">
+                            <span class="tech-badge">ConfigMaps</span>
+                            <span class="tech-badge">Secrets</span>
+                            <span class="tech-badge">RBAC</span>
+                        </div>
+                    </div>
+
+                    <div class="component-card">
+                        <h3>📊 Monitoring</h3>
+                        <ul>
+                            <li>Health endpoints on all services</li>
+                            <li>Kubernetes probe configuration</li>
+                            <li>Automatic pod restarts on failure</li>
+                            <li>Service mesh ready architecture</li>
+                            <li>Resource usage tracking</li>
+                        </ul>
+                        <div class="tech-stack">
+                            <span class="tech-badge">Health Probes</span>
+                            <span class="tech-badge">Metrics</span>
+                        </div>
+                    </div>
+
+                    <div class="component-card">
+                        <h3>🚀 Deployment</h3>
+                        <ul>
+                            <li>Declarative YAML manifests</li>
+                            <li>Rolling update strategy</li>
+                            <li>Version controlled configs</li>
+                            <li>Multi-environment support</li>
+                            <li>GitOps ready</li>
+                        </ul>
+                        <div class="tech-stack">
+                            <span class="tech-badge">Kubernetes</span>
+                            <span class="tech-badge">Helm Ready</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="version-info">Architecture v1.2.0</div>
+    </body>
+    </html>
+
+  nginx.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        location / {
+            root /usr/share/nginx/html;
+            try_files $uri /index.html;
+        }
+
+        location /api/ {
+            proxy_pass http://backend-api:3000/api/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_cache_bypass $http_upgrade;
+        }
+
+        location /health {
+            return 200 'healthy\n';
+        }
+
+        location /version {
+            return 200 'v1.2.0\n';
+        }
+    }
