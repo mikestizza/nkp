@@ -1,5 +1,4 @@
 # Frontend v1.0.0 - Initial Deployment (Light Mode Only)
-# Deploy this first via Kubernetes Web GUI
 
 # Frontend ConfigMap v1
 apiVersion: v1

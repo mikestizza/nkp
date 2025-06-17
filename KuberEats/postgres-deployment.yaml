@@ -154,7 +154,7 @@ spec:
     app: postgres
 
 ---
-# PostgreSQL Backup CronJob (Optional but recommended)
+# PostgreSQL Backup CronJob (Optional)
 apiVersion: batch/v1
 kind: CronJob
 metadata:
