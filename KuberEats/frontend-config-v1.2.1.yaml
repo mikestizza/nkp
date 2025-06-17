@@ -1,4 +1,5 @@
-# Frontend ConfigMap v1.2.0 - Simplified without dark mode
+# Frontend v1.2.1
+# Frontend ConfigMap with Architecture Page
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,7 +7,7 @@ metadata:
   namespace: kubereats
   labels:
     app: frontend
-    version: v1.2.0
+    version: v1.2.1
 data:
   index.html: |
     <!DOCTYPE html>
@@ -73,11 +74,11 @@ data:
             🛒 Cart <span class="cart-count" id="cartCount">0</span>
         </div>
 
-        <div class="version-info">v1.2.0</div>
+        <div class="version-info">v1.2.1</div>
 
         <script>
             const API_URL = '/api';
-            const APP_VERSION = 'v1.2.0';
+            const APP_VERSION = 'v1.2.1';
             let sessionId = localStorage.getItem('sessionId') || generateSessionId();
             let currentRestaurant = null;
             let cartItems = 0;
@@ -383,7 +384,7 @@ data:
             </div>
         </div>
 
-        <div class="version-info">Architecture v1.2.0</div>
+        <div class="version-info">Architecture v1.2.1</div>
     </body>
     </html>
 
@@ -411,6 +412,101 @@ data:
         }
 
         location /version {
-            return 200 'v1.2.0\n';
+            return 200 'v1.2.1\n';
         }
     }
+
+---
+# Frontend Deployment v1.2.1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: kubereats
+  labels:
+    app: frontend
+  annotations:
+    kubernetes.io/change-cause: "Deployment v1.2.1 with architecture page"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        version: v1.2.1
+      annotations:
+        configmap.version: "v1.2"
+    spec:
+      containers:
+      - name: frontend
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+          name: http
+        env:
+        - name: APP_VERSION
+          value: "v1.2.1"
+        - name: CONFIG_HASH
+          value: "architecture-added"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d
+      volumes:
+      - name: html
+        configMap:
+          name: frontend-config
+          items:
+          - key: index.html
+            path: index.html
+          - key: architecture.html
+            path: architecture.html
+      - name: nginx-config
+        configMap:
+          name: frontend-config
+          items:
+          - key: nginx.conf
+            path: default.conf
+
+---
+# Frontend Service 
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: kubereats
+  labels:
+    app: frontend
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: frontend
