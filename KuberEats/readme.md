@@ -10,7 +10,7 @@ KuberEats is a microservices-based food delivery application designed to demonst
 
 The application consists of three main components:
 
-- **Frontend** - React-based web UI served by Nginx
+- **Frontend** - Vanilla JavaScript SPA served by Nginx
 - **Backend API** - Node.js Express REST API
 - **Database** - PostgreSQL for persistent storage
 
@@ -19,6 +19,11 @@ The application consists of three main components:
 │   Frontend  │────▶│ Backend API │───▶│  PostgreSQL  │
 │   (Nginx)   │     │  (Node.js)  │     │   Database   │
 └─────────────┘     └─────────────┘     └──────────────┘
+    HTML/JS           Express.js          Tables:
+    2 replicas        2 replicas          - restaurants
+    Port 80           Port 3000           - menu_items
+    LoadBalancer      ClusterIP           - carts
+                                          - cart_items
 ```
 
 ## Features
