@@ -97,9 +97,12 @@ remote_exec() {
     
     if [ ! -z "$SSH_KEY" ]; then
         key_opt="-i $SSH_KEY"
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o PasswordAuthentication=no $key_opt $SSH_USER@$ip "$cmd" 2>/dev/null
+    elif [ ! -z "$SSH_PASSWORD" ]; then
+        sshpass -p "$SSH_PASSWORD" ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $SSH_USER@$ip "$cmd" 2>/dev/null
+    else
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $SSH_USER@$ip "$cmd" 2>/dev/null
     fi
-    
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes $key_opt $SSH_USER@$ip "$cmd" 2>/dev/null
 }
 
 # Function to execute command with sudo on remote node
@@ -110,9 +113,12 @@ remote_sudo_exec() {
     
     if [ ! -z "$SSH_KEY" ]; then
         key_opt="-i $SSH_KEY"
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o PasswordAuthentication=no $key_opt $SSH_USER@$ip "sudo $cmd" 2>/dev/null
+    elif [ ! -z "$SSH_PASSWORD" ]; then
+        sshpass -p "$SSH_PASSWORD" ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $SSH_USER@$ip "sudo $cmd" 2>/dev/null
+    else
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $SSH_USER@$ip "sudo $cmd" 2>/dev/null
     fi
-    
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes $key_opt $SSH_USER@$ip "sudo $cmd" 2>/dev/null
 }
 
 # Function to gather cluster configuration
