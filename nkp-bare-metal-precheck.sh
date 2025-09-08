@@ -389,9 +389,21 @@ if [ -z "$NODES" ]; then
     exit 1
 fi
 
+SSH_USER="nutanix"  # Update this as needed
+SSH_KEY="~/.ssh/id_rsa"  # Update this as needed
+
 for NODE in $NODES; do
+    echo "========================================="
     echo "Fixing prerequisites on $NODE..."
-    ssh $NODE << 'EOF'
+    echo "========================================="
+    
+    ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$NODE" << 'EOF'
+# Create user if not exists and setup sudo
+if ! id nutanix >/dev/null 2>&1; then
+    sudo useradd -m -s /bin/bash nutanix
+fi
+echo "nutanix ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/nutanix
+
 # Disable swap
 sudo swapoff -a
 sudo sed -i '/ swap / s/^/#/' /etc/fstab
@@ -415,9 +427,50 @@ sudo sysctl --system
 # Disable firewall
 sudo ufw disable 2>/dev/null || true
 
-echo "Prerequisites fixed on $NODE"
+# Remove old Kubernetes packages
+sudo apt-get remove -y kubelet kubeadm kubectl kubernetes-cni 2>/dev/null || true
+sudo rm -f /etc/apt/sources.list.d/kubernetes*.list
+
+# Update and install required packages
+sudo apt-get update
+sudo apt-get install -y \
+    curl \
+    wget \
+    socat \
+    conntrack \
+    ipset \
+    net-tools \
+    dnsutils \
+    chrony \
+    htop \
+    iotop \
+    sysstat
+
+# Enable time synchronization
+sudo systemctl enable --now chrony
+
+# Fix hostname resolution
+HOSTNAME=$(hostname)
+if ! grep -q "$HOSTNAME" /etc/hosts; then
+    echo "127.0.1.1 $HOSTNAME" | sudo tee -a /etc/hosts
+fi
+
+# Create storage directories (for worker nodes)
+sudo mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5}
+sudo chmod 777 /mnt/local-storage/*
+sudo mkdir -p /mnt/prometheus
+sudo chmod 777 /mnt/prometheus
+
+echo "Prerequisites fixed on $(hostname)"
+echo "Please verify time sync: timedatectl status"
+echo "Please verify DNS: nslookup google.com"
 EOF
 done
+
+echo "========================================="
+echo "Prerequisites script completed!"
+echo "IMPORTANT: Reboot all nodes to ensure all changes take effect"
+echo "Run: sudo reboot"
 FIX_SCRIPT
     chmod +x fix-prerequisites.sh
 fi
