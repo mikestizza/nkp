@@ -1,484 +1,238 @@
 #!/bin/bash
 
-# NKP Pre-provisioned Infrastructure Checker
-# Version: 4.0 - Production Ready
-# Purpose: Validate bare metal nodes are ready for NKP deployment
-# Design: Simple, reliable, portable, no dependencies
+# NKP Pre-provisioned Infrastructure Checker - READ ONLY
+# Version: 5.0 - Check only, no modifications
+# Validates bare metal nodes for Kubernetes deployment readiness
 
-set -euo pipefail
+set -u
 
-# Colors for output (works on most terminals)
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Configuration file support for repeatability
-CONFIG_FILE="${1:-}"
-SAVE_CONFIG=false
+# Config
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-REPORT_FILE="nkp-precheck-report-${TIMESTAMP}.txt"
+REPORT_FILE="nkp-readiness-report-${TIMESTAMP}.txt"
 
-# Initialize variables
-declare -a CONTROL_PLANE_IPS=()
-declare -a WORKER_IPS=()
-declare -a ALL_NODES=()
-VIP=""
-SSH_USER=""
-SSH_KEY_PATH=""
-DEPLOY_USER=""
-SILENT_MODE=false
+# Arrays
+CONTROL_PLANE_IPS=()
+WORKER_IPS=()
+ALL_NODES=()
+FAILED_NODES=0
+TOTAL_ISSUES=0
 
 # Simple logging
 log() {
     echo -e "$1" | tee -a "$REPORT_FILE"
 }
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1" | tee -a "$REPORT_FILE"
-}
+# Gather configuration
+echo "=== NKP Cluster Readiness Check (Read-Only) ==="
+echo ""
+read -p "Control plane IPs (comma-separated): " cp_input
+IFS=',' read -ra CONTROL_PLANE_IPS <<< "$cp_input"
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1" | tee -a "$REPORT_FILE"
-}
+read -p "Worker node IPs (comma-separated): " w_input
+IFS=',' read -ra WORKER_IPS <<< "$w_input"
 
-log_success() {
-    echo -e "${GREEN}[OK]${NC} $1" | tee -a "$REPORT_FILE"
-}
+read -p "VIP for API server: " VIP
+read -p "SSH user [$(whoami)]: " input
+SSH_USER=${input:-$(whoami)}
 
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1" | tee -a "$REPORT_FILE"
-}
+# Combine all nodes
+ALL_NODES=("${CONTROL_PLANE_IPS[@]}" "${WORKER_IPS[@]}")
 
-# Function to validate IP address
-validate_ip() {
-    local ip=$1
-    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        return 0
-    fi
-    return 1
-}
+echo ""
+log "Configuration:"
+log "  Control Plane: ${CONTROL_PLANE_IPS[*]}"
+log "  Workers: ${WORKER_IPS[*]}"
+log "  VIP: $VIP"
+log "  SSH User: $SSH_USER"
+echo ""
 
-# Load configuration from file
-load_config() {
-    local config_file=$1
-    if [[ -f "$config_file" ]]; then
-        log_info "Loading configuration from $config_file"
-        source "$config_file"
-        return 0
-    else
-        log_error "Configuration file not found: $config_file"
-        return 1
-    fi
-}
-
-# Save configuration for reuse
-save_config() {
-    local config_file="nkp-config-${TIMESTAMP}.conf"
-    cat > "$config_file" <<EOF
-# NKP Pre-check Configuration
-# Generated: $(date)
-
-# Control Plane IPs (comma-separated)
-CONTROL_PLANE_IPS=(${CONTROL_PLANE_IPS[@]})
-
-# Worker Node IPs (comma-separated)  
-WORKER_IPS=(${WORKER_IPS[@]})
-
-# Virtual IP for API Server
-VIP="$VIP"
-
-# SSH Configuration
-SSH_USER="$SSH_USER"
-SSH_KEY_PATH="$SSH_KEY_PATH"
-
-# Deployment User (will be created/verified on nodes)
-DEPLOY_USER="$DEPLOY_USER"
-EOF
-    log_success "Configuration saved to $config_file"
-    log_info "Reuse with: $0 $config_file"
-}
-
-# Interactive configuration gathering
-gather_config() {
-    log_info "=== Cluster Configuration ==="
-    
-    # SSH User
-    read -p "SSH username for nodes [current user: $(whoami)]: " input
-    SSH_USER=${input:-$(whoami)}
-    
-    # SSH Key
-    default_key="$HOME/.ssh/id_rsa"
-    read -p "SSH private key path [$default_key]: " input
-    SSH_KEY_PATH=${input:-$default_key}
-    
-    if [[ ! -f "$SSH_KEY_PATH" ]]; then
-        log_warn "SSH key not found at $SSH_KEY_PATH"
-        read -p "Continue without key (will use password auth)? [y/N]: " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
-        SSH_KEY_PATH=""
-    fi
-    
-    # Deployment user
-    read -p "Deployment username [nkp]: " input
-    DEPLOY_USER=${input:-nkp}
-    
-    # Control plane nodes
-    read -p "Control plane IPs (comma-separated): " input
-    IFS=',' read -ra CONTROL_PLANE_IPS <<< "$input"
-    for ip in "${CONTROL_PLANE_IPS[@]}"; do
-        ip=$(echo "$ip" | xargs)
-        validate_ip "$ip" || { log_error "Invalid IP: $ip"; exit 1; }
-        ALL_NODES+=("$ip")
-    done
-    
-    # Worker nodes
-    read -p "Worker node IPs (comma-separated): " input
-    IFS=',' read -ra WORKER_IPS <<< "$input"
-    for ip in "${WORKER_IPS[@]}"; do
-        ip=$(echo "$ip" | xargs)
-        validate_ip "$ip" || { log_error "Invalid IP: $ip"; exit 1; }
-        ALL_NODES+=("$ip")
-    done
-    
-    # VIP
-    read -p "Virtual IP (VIP) for API server: " VIP
-    validate_ip "$VIP" || { log_error "Invalid VIP: $VIP"; exit 1; }
-    
-    # Save config option
-    read -p "Save configuration for reuse? [Y/n]: " save
-    [[ "$save" =~ ^[Nn]$ ]] || SAVE_CONFIG=true
-}
-
-# Simple SSH test - just check if we can connect
-test_ssh() {
-    local node=$1
-    local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=no"
-    
-    if [[ -n "$SSH_KEY_PATH" ]]; then
-        ssh_opts="$ssh_opts -i $SSH_KEY_PATH"
-    fi
-    
-    if ssh $ssh_opts "$SSH_USER@$node" "echo 'SSH_OK'" 2>/dev/null | grep -q "SSH_OK"; then
-        return 0
-    fi
-    return 1
-}
-
-# Execute command on remote node
-run_remote() {
+# Function to run remote command
+run_cmd() {
     local node=$1
     local cmd=$2
-    local ssh_opts="-o ConnectTimeout=5 -o StrictHostKeyChecking=no"
-    
-    if [[ -n "$SSH_KEY_PATH" ]]; then
-        ssh_opts="$ssh_opts -i $SSH_KEY_PATH"
-    fi
-    
-    ssh $ssh_opts "$SSH_USER@$node" "$cmd" 2>/dev/null
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$SSH_USER@$node" "$cmd" 2>/dev/null
 }
 
 # Check single node
 check_node() {
     local node=$1
     local node_type=$2
-    local failed_checks=0
+    local issues=0
     
-    log_info "\nChecking $node_type node: $node"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Checking $node_type: $node"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     
-    # 1. SSH connectivity
-    echo -n "  SSH connectivity: "
-    if test_ssh "$node"; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${RED}✗${NC}"
-        log_error "Cannot SSH to $node"
-        return 1
-    fi
-    
-    # 2. Hostname
-    echo -n "  Hostname: "
-    local hostname=$(run_remote "$node" "hostname" || echo "unknown")
-    echo "$hostname"
-    
-    # 3. Network interface
-    echo -n "  Primary interface: "
-    local iface=$(run_remote "$node" "ip -4 route show default | grep -oP 'dev \K\S+'" || echo "unknown")
-    echo "$iface"
-    
-    # 4. Kernel modules
-    echo -n "  Kernel modules (overlay, br_netfilter): "
-    if run_remote "$node" "lsmod | grep -q overlay && lsmod | grep -q br_netfilter"; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${YELLOW}Missing${NC}"
-        ((failed_checks++))
-    fi
-    
-    # 5. Swap
-    echo -n "  Swap disabled: "
-    if run_remote "$node" "swapon -s | grep -q '^/'"; then
-        echo -e "${YELLOW}Enabled${NC}"
-        ((failed_checks++))
-    else
-        echo -e "${GREEN}✓${NC}"
-    fi
-    
-    # 6. IP forwarding
-    echo -n "  IP forwarding: "
-    local ipf=$(run_remote "$node" "sysctl -n net.ipv4.ip_forward" || echo "0")
-    if [[ "$ipf" == "1" ]]; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${YELLOW}Disabled${NC}"
-        ((failed_checks++))
-    fi
-    
-    # 7. Check deployment user
-    echo -n "  User '$DEPLOY_USER': "
-    if run_remote "$node" "id $DEPLOY_USER" &>/dev/null; then
-        echo -e "${GREEN}Exists${NC}"
+    # Run all checks in a single SSH session
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$SSH_USER@$node" '
+        echo "  Hostname: $(hostname)"
+        echo ""
         
-        # Check sudo
-        echo -n "    Sudo access: "
-        if run_remote "$node" "sudo -l -U $DEPLOY_USER 2>/dev/null | grep -q 'NOPASSWD.*ALL'"; then
-            echo -e "${GREEN}✓${NC}"
-        else
-            echo -e "${YELLOW}Needs configuration${NC}"
-            ((failed_checks++))
+        echo "  Network Configuration:"
+        echo -n "    • Primary Interface (VIP binding): "
+        ip -4 route show default | grep -oP "dev \K\S+" || echo "unknown"
+        
+        echo ""
+        echo "  System Requirements:"
+        
+        echo -n "    • Swap Status (must be disabled): "
+        if swapon -s 2>/dev/null | grep -q "^/"; then 
+            echo -e "\033[0;31m✗ ENABLED\033[0m"
+            issues=$((issues + 1))
+        else 
+            echo -e "\033[0;32m✓ Disabled\033[0m"
         fi
-    else
-        echo -e "${YELLOW}Not found${NC}"
-        ((failed_checks++))
-    fi
-    
-    # 8. Container runtime
-    echo -n "  Container runtime: "
-    if run_remote "$node" "command -v docker" &>/dev/null; then
-        echo -e "${GREEN}Docker${NC}"
-    elif run_remote "$node" "command -v containerd" &>/dev/null; then
-        echo -e "${GREEN}Containerd${NC}"
-    else
-        echo -e "${YELLOW}None${NC}"
-        ((failed_checks++))
-    fi
-    
-    # 9. Worker-specific: storage directories
-    if [[ "$node_type" == "worker" ]]; then
-        echo -n "  Storage directories: "
-        if run_remote "$node" "test -d /mnt/local-storage/pv1" &>/dev/null; then
-            echo -e "${GREEN}✓${NC}"
-        else
-            echo -e "${YELLOW}Not configured${NC}"
-            ((failed_checks++))
+        
+        echo -n "    • Kernel Modules (networking): "
+        if lsmod | grep -q overlay && lsmod | grep -q br_netfilter; then 
+            echo -e "\033[0;32m✓ Loaded\033[0m"
+        else 
+            echo -e "\033[0;31m✗ MISSING\033[0m"
+            issues=$((issues + 1))
         fi
-    fi
-    
-    return $failed_checks
-}
-
-# Apply fixes to node
-fix_node() {
-    local node=$1
-    local node_type=$2
-    
-    log_info "Applying fixes to $node..."
-    
-    # Create fix script to run on remote node
-    local fix_script='
-#!/bin/bash
-set -e
-
-DEPLOY_USER="'$DEPLOY_USER'"
-NODE_TYPE="'$node_type'"
-
-echo "Starting fixes on $(hostname)..."
-
-# 1. Create deployment user if needed
-if ! id "$DEPLOY_USER" &>/dev/null; then
-    echo "Creating user $DEPLOY_USER..."
-    sudo useradd -m -s /bin/bash "$DEPLOY_USER" || true
-    echo "$DEPLOY_USER:changeme123" | sudo chpasswd
-fi
-
-# 2. Configure sudo for deployment user
-echo "Configuring sudo for $DEPLOY_USER..."
-echo "$DEPLOY_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$DEPLOY_USER
-sudo usermod -aG sudo "$DEPLOY_USER" 2>/dev/null || true
-
-# 3. Disable swap
-echo "Disabling swap..."
-sudo swapoff -a
-sudo sed -i "/ swap / s/^/#/" /etc/fstab
-
-# 4. Load kernel modules
-echo "Loading kernel modules..."
-sudo modprobe overlay
-sudo modprobe br_netfilter
-cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
-overlay
-br_netfilter
-EOF
-
-# 5. Configure sysctl for Kubernetes
-echo "Configuring sysctl..."
-cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward = 1
-EOF
-sudo sysctl --system >/dev/null 2>&1
-
-# 6. Disable UFW firewall
-echo "Disabling UFW firewall..."
-sudo ufw disable 2>/dev/null || true
-
-# 7. Clean up existing Kubernetes packages
-echo "Cleaning Kubernetes packages..."
-sudo apt-get remove -y kubelet kubeadm kubectl kubernetes-cni 2>/dev/null || true
-sudo rm -f /etc/apt/sources.list.d/kubernetes*.list
-sudo apt-get update >/dev/null 2>&1 || true
-
-# 8. Worker-specific: storage directories
-if [[ "$NODE_TYPE" == "worker" ]]; then
-    echo "Creating storage directories for worker..."
-    sudo mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5}
-    sudo chmod 777 /mnt/local-storage/*
-    sudo mkdir -p /mnt/prometheus
-    sudo chmod 777 /mnt/prometheus
-fi
-
-echo "Fixes applied successfully!"
-'
-    
-    # Execute fix script on remote node
-    if run_remote "$node" "$fix_script"; then
-        log_success "Fixes applied to $node"
-    else
-        log_error "Failed to apply some fixes to $node"
-    fi
-}
-
-# Test network connectivity between nodes
-test_connectivity() {
-    log_info "\n=== Network Connectivity Test ==="
-    
-    # Test VIP availability
-    echo -n "VIP $VIP availability: "
-    if ping -c 1 -W 2 "$VIP" &>/dev/null; then
-        echo -e "${RED}In use (should be free!)${NC}"
-        log_warn "VIP is already in use!"
-    else
-        echo -e "${GREEN}Available${NC}"
-    fi
-    
-    # Test node-to-node connectivity
-    log_info "\nNode-to-node connectivity:"
-    for source in "${ALL_NODES[@]}"; do
-        echo -n "  From $source: "
-        local reachable=0
-        local total=0
-        for target in "${ALL_NODES[@]}"; do
-            [[ "$source" == "$target" ]] && continue
-            ((total++))
-            if run_remote "$source" "ping -c 1 -W 1 $target" &>/dev/null; then
-                ((reachable++))
+        
+        echo -n "    • IP Forwarding (pod routing): "
+        if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ]; then 
+            echo -e "\033[0;32m✓ Enabled\033[0m"
+        else 
+            echo -e "\033[0;31m✗ DISABLED\033[0m"
+            issues=$((issues + 1))
+        fi
+        
+        echo -n "    • Bridge Netfilter (iptables): "
+        if [ "$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)" = "1" ]; then 
+            echo -e "\033[0;32m✓ Enabled\033[0m"
+        else 
+            echo -e "\033[0;31m✗ DISABLED\033[0m"
+            issues=$((issues + 1))
+        fi
+        
+        echo -n "    • Firewall Status: "
+        if ufw status 2>/dev/null | grep -q "Status: active"; then 
+            echo -e "\033[1;33m⚠ ACTIVE (verify K8s ports)\033[0m"
+            issues=$((issues + 1))
+        else 
+            echo -e "\033[0;32m✓ Disabled\033[0m"
+        fi
+        
+        echo -n "    • Container Runtime: "
+        if command -v containerd &>/dev/null; then 
+            echo -e "\033[0;32m✓ Containerd installed\033[0m"
+        else 
+            echo -e "\033[0;31m✗ NOT FOUND\033[0m"
+            issues=$((issues + 1))
+        fi
+        
+        echo -n "    • Old K8s Packages: "
+        if dpkg -l 2>/dev/null | grep -E "kubelet|kubeadm|kubectl" | grep -q "^ii"; then 
+            echo -e "\033[1;33m⚠ Found (should be removed)\033[0m"
+            issues=$((issues + 1))
+        else 
+            echo -e "\033[0;32m✓ Clean\033[0m"
+        fi
+        
+        if [ "'$node_type'" = "worker" ]; then
+            echo ""
+            echo "  Worker Storage Requirements:"
+            
+            echo -n "    • Local PV Directories: "
+            if [ -d /mnt/local-storage/pv1 ]; then 
+                echo -e "\033[0;32m✓ Configured\033[0m"
+            else 
+                echo -e "\033[0;31m✗ NOT FOUND\033[0m"
+                issues=$((issues + 1))
             fi
-        done
-        echo "$reachable/$total nodes reachable"
-    done
+            
+            echo -n "    • Prometheus Storage: "
+            if [ -d /mnt/prometheus ]; then 
+                echo -e "\033[0;32m✓ Configured\033[0m"
+            else 
+                echo -e "\033[0;31m✗ NOT FOUND\033[0m"
+                issues=$((issues + 1))
+            fi
+        fi
+        
+        exit $issues
+    '
+    
+    local result=$?
+    if [ $result -gt 0 ]; then
+        echo ""
+        echo -e "  ${YELLOW}Issues found: $result${NC}"
+        TOTAL_ISSUES=$((TOTAL_ISSUES + result))
+    else
+        echo ""
+        echo -e "  ${GREEN}✓ All checks passed${NC}"
+    fi
+    
+    echo ""
+    return $result
 }
 
 # Main execution
-main() {
-    log "NKP Pre-provisioned Infrastructure Checker v4.0"
-    log "Report: $REPORT_FILE"
-    log "================================================\n"
-    
-    # Load or gather configuration
-    if [[ -n "$CONFIG_FILE" ]]; then
-        load_config "$CONFIG_FILE" || exit 1
-    else
-        gather_config
-        [[ "$SAVE_CONFIG" == true ]] && save_config
-    fi
-    
-    # Display configuration
-    log_info "\nConfiguration Summary:"
-    log "  Control Plane: ${#CONTROL_PLANE_IPS[@]} nodes"
-    log "  Workers: ${#WORKER_IPS[@]} nodes"
-    log "  VIP: $VIP"
-    log "  SSH User: $SSH_USER"
-    log "  Deploy User: $DEPLOY_USER"
-    
-    # Phase 1: Check all nodes
-    log_info "\n=== Phase 1: Node Validation ==="
-    local total_issues=0
-    
-    for node in "${CONTROL_PLANE_IPS[@]}"; do
-        check_node "$node" "control-plane"
-        total_issues=$((total_issues + $?))
-    done
-    
-    for node in "${WORKER_IPS[@]}"; do
-        check_node "$node" "worker"
-        total_issues=$((total_issues + $?))
-    done
-    
-    # Phase 2: Offer fixes if issues found
-    if [[ $total_issues -gt 0 ]]; then
-        log_warn "\nFound $total_issues issue(s) across all nodes"
-        read -p "Apply automatic fixes? [y/N]: " apply_fixes
-        
-        if [[ "$apply_fixes" =~ ^[Yy]$ ]]; then
-            log_info "\n=== Phase 2: Applying Fixes ==="
-            
-            for node in "${CONTROL_PLANE_IPS[@]}"; do
-                fix_node "$node" "control-plane"
-            done
-            
-            for node in "${WORKER_IPS[@]}"; do
-                fix_node "$node" "worker"
-            done
-            
-            log_info "\n=== Re-checking After Fixes ==="
-            total_issues=0
-            for node in "${CONTROL_PLANE_IPS[@]}"; do
-                check_node "$node" "control-plane"
-                total_issues=$((total_issues + $?))
-            done
-            
-            for node in "${WORKER_IPS[@]}"; do
-                check_node "$node" "worker"
-                total_issues=$((total_issues + $?))
-            done
-        fi
-    fi
-    
-    # Phase 3: Network connectivity
-    test_connectivity
-    
-    # Final summary
-    log_info "\n=== Final Summary ==="
-    if [[ $total_issues -eq 0 ]]; then
-        log_success "✓ All nodes passed validation!"
-        log_success "✓ Cluster is ready for NKP deployment"
-        
-        # Show interface info for deployment
-        log_info "\nFor NKP deployment, use:"
-        local first_cp="${CONTROL_PLANE_IPS[0]}"
-        local iface=$(run_remote "$first_cp" "ip -4 route show default | grep -oP 'dev \K\S+'" || echo "eth0")
-        log "  --virtual-ip-interface $iface"
-        log "  --control-plane-endpoint-host $VIP"
-    else
-        log_error "✗ Found $total_issues issue(s)"
-        log_error "✗ Fix issues before deployment"
-    fi
-    
-    log "\n================================================"
-    log "Full report saved to: $REPORT_FILE"
-}
+echo "=== Starting Cluster Validation ==="
+echo "Checking prerequisites for NKP deployment..."
+echo ""
 
-# Run main
-main "$@"
+for node in "${CONTROL_PLANE_IPS[@]}"; do
+    if ! check_node "$node" "control-plane"; then
+        FAILED_NODES=$((FAILED_NODES + 1))
+    fi
+done
+
+for node in "${WORKER_IPS[@]}"; do
+    if ! check_node "$node" "worker"; then
+        FAILED_NODES=$((FAILED_NODES + 1))
+    fi
+done
+
+# Network test
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Network Validation"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -n "  VIP $VIP Status: "
+if ping -c 1 -W 2 "$VIP" &>/dev/null; then
+    echo -e "${RED}✗ IN USE (must be free!)${NC}"
+    TOTAL_ISSUES=$((TOTAL_ISSUES + 1))
+else
+    echo -e "${GREEN}✓ Available${NC}"
+fi
+
+# Final summary
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "VALIDATION SUMMARY"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+if [ $TOTAL_ISSUES -eq 0 ]; then
+    echo -e "${GREEN}✓ CLUSTER READY${NC}"
+    echo "All nodes passed validation checks"
+else
+    echo -e "${RED}✗ CLUSTER NOT READY${NC}"
+    echo "Found $TOTAL_ISSUES total issue(s) across $FAILED_NODES node(s)"
+    echo ""
+    echo "Required fixes:"
+    echo "  • Disable swap: swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab"
+    echo "  • Load modules: modprobe overlay br_netfilter"
+    echo "  • Enable IP forward: sysctl -w net.ipv4.ip_forward=1"
+    echo "  • Configure bridge: sysctl -w net.bridge.bridge-nf-call-iptables=1"
+    echo "  • Disable firewall: ufw disable"
+    echo "  • Install containerd if missing"
+    echo "  • Create worker storage: mkdir -p /mnt/local-storage/pv{1..5} /mnt/prometheus"
+fi
+
+echo ""
+echo "Deployment parameters for NKP:"
+first_cp="${CONTROL_PLANE_IPS[0]}"
+iface=$(run_cmd "$first_cp" "ip -4 route show default | grep -oP 'dev \K\S+'" || echo "eth0")
+echo "  --virtual-ip-interface $iface"
+echo "  --control-plane-endpoint-host $VIP"
+echo ""
+echo "Full report saved to: $REPORT_FILE"
