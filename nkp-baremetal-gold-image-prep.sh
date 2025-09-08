@@ -111,13 +111,19 @@ check_and_fix "ubuntu_version" \
     "echo 'Cannot auto-fix OS version - manual reinstall required'" \
     "Ubuntu 22.04 LTS"
 
-# 2. Check and disable swap
+# 2. Check and create NKP user with sudo
+check_and_fix "nkp_user" \
+    "id nutanix >/dev/null 2>&1 && sudo -u nutanix -n true 2>/dev/null" \
+    "useradd -m -s /bin/bash nutanix 2>/dev/null || true; echo 'nutanix ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/nutanix" \
+    "NKP user (nutanix) with passwordless sudo"
+
+# 3. Check and disable swap
 check_and_fix "swap" \
     "[[ $(swapon -s | wc -l) -eq 0 ]]" \
     "swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab" \
     "Swap disabled"
 
-# 3. Check and load kernel modules
+# 4. Check and load kernel modules
 check_and_fix "overlay_module" \
     "lsmod | grep -q overlay" \
     "modprobe overlay && echo 'overlay' >> /etc/modules-load.d/k8s.conf" \
@@ -128,7 +134,7 @@ check_and_fix "br_netfilter_module" \
     "modprobe br_netfilter && echo 'br_netfilter' >> /etc/modules-load.d/k8s.conf" \
     "br_netfilter kernel module"
 
-# 4. Check and configure sysctl settings
+# 5. Check and configure sysctl settings
 check_and_fix "ip_forward" \
     "[[ $(sysctl -n net.ipv4.ip_forward) == '1' ]]" \
     "echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/k8s.conf && sysctl -p /etc/sysctl.d/k8s.conf" \
@@ -144,37 +150,91 @@ check_and_fix "bridge_nf_call_ip6tables" \
     "echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.d/k8s.conf && sysctl -p /etc/sysctl.d/k8s.conf" \
     "Bridge netfilter for ip6tables"
 
-# 5. Check and disable firewall
+# 6. Check and disable firewall
 check_and_fix "ufw_disabled" \
     "! ufw status 2>/dev/null | grep -q 'Status: active'" \
     "ufw disable" \
     "UFW firewall disabled"
 
-# 6. Check for conflicting Kubernetes packages
+# 7. Check time synchronization
+check_and_fix "time_sync" \
+    "[[ $(timedatectl show --property=NTPSynchronized --value) == 'yes' ]]" \
+    "apt-get install -y chrony >/dev/null 2>&1 && systemctl enable --now chrony" \
+    "NTP time synchronization"
+
+# 8. Check DNS resolution
+check_and_fix "dns_resolution" \
+    "nslookup google.com >/dev/null 2>&1" \
+    "echo 'nameserver 8.8.8.8' >> /etc/resolv.conf" \
+    "DNS resolution"
+
+# 9. Check hostname resolution
+check_and_fix "hostname_resolution" \
+    "getent hosts $(hostname) >/dev/null 2>&1" \
+    "echo '127.0.1.1 $(hostname)' >> /etc/hosts" \
+    "Hostname resolution in /etc/hosts"
+
+# 10. Check required packages
+REQUIRED_PACKAGES="curl wget socat conntrack ipset net-tools dnsutils chrony"
+check_and_fix "required_packages" \
+    "which curl wget socat conntrack ipset >/dev/null 2>&1" \
+    "apt-get update >/dev/null 2>&1 && apt-get install -y $REQUIRED_PACKAGES >/dev/null 2>&1" \
+    "Required system packages"
+
+# 11. Check for conflicting Kubernetes packages
 check_and_fix "no_existing_k8s" \
     "! (dpkg -l | grep -qE 'kubelet|kubeadm|kubectl|kubernetes-cni')" \
     "apt-get remove -y kubelet kubeadm kubectl kubernetes-cni 2>/dev/null; rm -f /etc/apt/sources.list.d/kubernetes*.list" \
     "No conflicting Kubernetes packages"
 
-# 7. Check disk space (minimum 50GB free)
+# 12. Check AppArmor (warning only)
+apparmor_profiles=$(aa-status 2>/dev/null | grep -c 'profiles are in enforce mode' || echo "0")
+if [ "$apparmor_profiles" -gt 0 ]; then
+    print_msg "$YELLOW" "\n⚠ WARNING: AppArmor has $apparmor_profiles enforcing profiles"
+    print_msg "$YELLOW" "  This may cause issues with container operations"
+fi
+
+# 13. Check NetworkManager (warning only)
+if systemctl is-active NetworkManager >/dev/null 2>&1; then
+    print_msg "$YELLOW" "\n⚠ WARNING: NetworkManager is active"
+    print_msg "$YELLOW" "  This may interfere with CNI networking"
+    if [ "$FIX_MODE" = true ]; then
+        print_msg "$YELLOW" "  → Disabling NetworkManager..."
+        systemctl disable --now NetworkManager 2>/dev/null
+    fi
+fi
+
+# 14. Check disk space (minimum 50GB free on root)
 check_and_fix "disk_space" \
     "[[ $(df -BG / | awk 'NR==2 {print int($4)}') -ge 50 ]]" \
     "echo 'Cannot auto-fix disk space - manual cleanup required'" \
-    "Minimum 50GB free disk space"
+    "Minimum 50GB free disk space on /"
 
-# 8. Check memory (minimum 8GB)
+# 15. Check /var space (minimum 30GB)
+check_and_fix "var_space" \
+    "[[ $(df -BG /var | awk 'NR==2 {print int($4)}') -ge 30 ]]" \
+    "echo 'Cannot auto-fix /var space - manual cleanup required'" \
+    "Minimum 30GB free space in /var"
+
+# 16. Check memory (minimum 8GB)
 check_and_fix "memory" \
     "[[ $(free -g | awk '/^Mem:/ {print int($2)}') -ge 8 ]]" \
     "echo 'Cannot auto-fix memory - hardware upgrade required'" \
     "Minimum 8GB RAM"
 
-# 9. Check CPU cores (minimum 4)
+# 17. Check CPU cores (minimum 4)
 check_and_fix "cpu_cores" \
     "[[ $(nproc) -ge 4 ]]" \
     "echo 'Cannot auto-fix CPU cores - hardware upgrade required'" \
     "Minimum 4 CPU cores"
 
-# 10. Create required directories for local storage
+# 18. Check overlay filesystem support
+check_and_fix "overlay_fs" \
+    "grep -q overlay /proc/filesystems" \
+    "echo 'Overlay filesystem not supported - kernel upgrade may be required'" \
+    "Overlay filesystem support"
+
+# 19. Create required directories for local storage
 check_and_fix "storage_dirs" \
     "[[ -d /mnt/local-storage/pv1 ]]" \
     "mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5} && chmod 777 /mnt/local-storage/*" \
