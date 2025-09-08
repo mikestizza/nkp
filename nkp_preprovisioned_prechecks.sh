@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# NKP Pre-requisite Checker - ASCII Only
-# Version: 7.0 - No special characters
+# NKP Pre-requisite Checker
 
 set -u
 
