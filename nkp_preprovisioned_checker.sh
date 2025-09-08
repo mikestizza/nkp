@@ -82,7 +82,8 @@ test_ssh_connection() {
         key_opt="-i $SSH_KEY"
     fi
     
-    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes $key_opt $user@$ip "echo connected" &>/dev/null; then
+    # Remove BatchMode to allow password prompt
+    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $key_opt $user@$ip "echo connected" 2>&1 | grep -q "connected"; then
         return 0
     else
         return 1
