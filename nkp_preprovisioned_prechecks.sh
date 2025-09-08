@@ -1,8 +1,7 @@
 #!/bin/bash
 
-# NKP Pre-provisioned Infrastructure Checker - READ ONLY
-# Version: 5.0 - Check only, no modifications
-# Validates bare metal nodes for Kubernetes deployment readiness
+# NKP Pre-requisite Checker - ASCII Only
+# Version: 7.0 - No special characters
 
 set -u
 
@@ -10,19 +9,17 @@ set -u
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 NC='\033[0m'
 
 # Config
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-REPORT_FILE="nkp-readiness-report-${TIMESTAMP}.txt"
+REPORT_FILE="nkp-readiness-${TIMESTAMP}.txt"
 
 # Arrays
 CONTROL_PLANE_IPS=()
 WORKER_IPS=()
-ALL_NODES=()
-FAILED_NODES=0
-TOTAL_ISSUES=0
+DEPLOY_USER=""
+SSH_USER=""
 
 # Simple logging
 log() {
@@ -30,209 +27,232 @@ log() {
 }
 
 # Gather configuration
-echo "=== NKP Cluster Readiness Check (Read-Only) ==="
+echo "=== NKP Pre-requisite Checker ==="
 echo ""
+read -p "Deployment username to check: " DEPLOY_USER
 read -p "Control plane IPs (comma-separated): " cp_input
 IFS=',' read -ra CONTROL_PLANE_IPS <<< "$cp_input"
 
 read -p "Worker node IPs (comma-separated): " w_input
 IFS=',' read -ra WORKER_IPS <<< "$w_input"
 
-read -p "VIP for API server: " VIP
 read -p "SSH user [$(whoami)]: " input
 SSH_USER=${input:-$(whoami)}
 
-# Combine all nodes
-ALL_NODES=("${CONTROL_PLANE_IPS[@]}" "${WORKER_IPS[@]}")
-
 echo ""
 log "Configuration:"
-log "  Control Plane: ${CONTROL_PLANE_IPS[*]}"
-log "  Workers: ${WORKER_IPS[*]}"
-log "  VIP: $VIP"
+log "  Deploy User: $DEPLOY_USER"
+log "  Control Plane: ${#CONTROL_PLANE_IPS[@]} nodes"
+log "  Workers: ${#WORKER_IPS[@]} nodes"
 log "  SSH User: $SSH_USER"
 echo ""
 
-# Function to run remote command
-run_cmd() {
-    local node=$1
-    local cmd=$2
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$SSH_USER@$node" "$cmd" 2>/dev/null
-}
-
-# Check single node
+# Check function for single node
 check_node() {
     local node=$1
     local node_type=$2
-    local issues=0
     
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Checking $node_type: $node"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    # Trim whitespace from node IP
+    node=$(echo "$node" | xargs)
     
-    # Run all checks in a single SSH session
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$SSH_USER@$node" '
-        echo "  Hostname: $(hostname)"
-        echo ""
+    echo "========================================="
+    echo "$node_type: $node"
+    echo "========================================="
+    
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$SSH_USER@$node" "
+        DEPLOY_USER='$DEPLOY_USER'
+        NODE_TYPE='$node_type'
         
-        echo "  Network Configuration:"
-        echo -n "    • Primary Interface (VIP binding): "
-        ip -4 route show default | grep -oP "dev \K\S+" || echo "unknown"
-        
-        echo ""
-        echo "  System Requirements:"
-        
-        echo -n "    • Swap Status (must be disabled): "
-        if swapon -s 2>/dev/null | grep -q "^/"; then 
-            echo -e "\033[0;31m✗ ENABLED\033[0m"
-            issues=$((issues + 1))
-        else 
-            echo -e "\033[0;32m✓ Disabled\033[0m"
-        fi
-        
-        echo -n "    • Kernel Modules (networking): "
-        if lsmod | grep -q overlay && lsmod | grep -q br_netfilter; then 
-            echo -e "\033[0;32m✓ Loaded\033[0m"
-        else 
-            echo -e "\033[0;31m✗ MISSING\033[0m"
-            issues=$((issues + 1))
-        fi
-        
-        echo -n "    • IP Forwarding (pod routing): "
-        if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ]; then 
-            echo -e "\033[0;32m✓ Enabled\033[0m"
-        else 
-            echo -e "\033[0;31m✗ DISABLED\033[0m"
-            issues=$((issues + 1))
-        fi
-        
-        echo -n "    • Bridge Netfilter (iptables): "
-        if [ "$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)" = "1" ]; then 
-            echo -e "\033[0;32m✓ Enabled\033[0m"
-        else 
-            echo -e "\033[0;31m✗ DISABLED\033[0m"
-            issues=$((issues + 1))
-        fi
-        
-        echo -n "    • Firewall Status: "
-        if ufw status 2>/dev/null | grep -q "Status: active"; then 
-            echo -e "\033[1;33m⚠ ACTIVE (verify K8s ports)\033[0m"
-            issues=$((issues + 1))
-        else 
-            echo -e "\033[0;32m✓ Disabled\033[0m"
-        fi
-        
-        echo -n "    • Container Runtime: "
-        if command -v containerd &>/dev/null; then 
-            echo -e "\033[0;32m✓ Containerd installed\033[0m"
-        else 
-            echo -e "\033[0;31m✗ NOT FOUND\033[0m"
-            issues=$((issues + 1))
-        fi
-        
-        echo -n "    • Old K8s Packages: "
-        if dpkg -l 2>/dev/null | grep -E "kubelet|kubeadm|kubectl" | grep -q "^ii"; then 
-            echo -e "\033[1;33m⚠ Found (should be removed)\033[0m"
-            issues=$((issues + 1))
-        else 
-            echo -e "\033[0;32m✓ Clean\033[0m"
-        fi
-        
-        if [ "'$node_type'" = "worker" ]; then
-            echo ""
-            echo "  Worker Storage Requirements:"
-            
-            echo -n "    • Local PV Directories: "
-            if [ -d /mnt/local-storage/pv1 ]; then 
-                echo -e "\033[0;32m✓ Configured\033[0m"
-            else 
-                echo -e "\033[0;31m✗ NOT FOUND\033[0m"
-                issues=$((issues + 1))
+        echo '1. User Configuration:'
+        echo -n '   User '\$DEPLOY_USER' exists: '
+        if id \$DEPLOY_USER &>/dev/null; then 
+            echo -e '\033[0;32m[PASS]\033[0m'
+            echo -n '   In sudo group: '
+            if groups \$DEPLOY_USER | grep -q sudo; then
+                echo -e '\033[0;32m[PASS]\033[0m'
+            else
+                echo -e '\033[0;31m[FAIL]\033[0m'
             fi
-            
-            echo -n "    • Prometheus Storage: "
-            if [ -d /mnt/prometheus ]; then 
-                echo -e "\033[0;32m✓ Configured\033[0m"
-            else 
-                echo -e "\033[0;31m✗ NOT FOUND\033[0m"
-                issues=$((issues + 1))
+            echo -n '   Has NOPASSWD sudo: '
+            if [ -f /etc/sudoers.d/\$DEPLOY_USER ] && grep -q 'NOPASSWD:ALL' /etc/sudoers.d/\$DEPLOY_USER; then
+                echo -e '\033[0;32m[PASS]\033[0m'
+            else
+                echo -e '\033[0;31m[FAIL]\033[0m'
             fi
+        else 
+            echo -e '\033[0;31m[FAIL] User not found\033[0m'
         fi
         
-        exit $issues
-    '
-    
-    local result=$?
-    if [ $result -gt 0 ]; then
-        echo ""
-        echo -e "  ${YELLOW}Issues found: $result${NC}"
-        TOTAL_ISSUES=$((TOTAL_ISSUES + result))
-    else
-        echo ""
-        echo -e "  ${GREEN}✓ All checks passed${NC}"
-    fi
+        echo ''
+        echo '2. Swap Status:'
+        echo -n '   Swap disabled: '
+        if swapon -s 2>/dev/null | grep -q '^/'; then 
+            echo -e '\033[0;31m[FAIL] Swap is active\033[0m'
+        else 
+            echo -e '\033[0;32m[PASS]\033[0m'
+        fi
+        echo -n '   Swap in /etc/fstab: '
+        if grep -q '^[^#].*swap' /etc/fstab; then
+            echo -e '\033[0;31m[FAIL] Not commented out\033[0m'
+        else
+            echo -e '\033[0;32m[PASS] Disabled\033[0m'
+        fi
+        
+        echo ''
+        echo '3. Kernel Modules:'
+        echo -n '   overlay loaded: '
+        if lsmod | grep -q overlay; then 
+            echo -e '\033[0;32m[PASS]\033[0m'
+        else 
+            echo -e '\033[0;31m[FAIL]\033[0m'
+        fi
+        echo -n '   br_netfilter loaded: '
+        if lsmod | grep -q br_netfilter; then 
+            echo -e '\033[0;32m[PASS]\033[0m'
+        else 
+            echo -e '\033[0;31m[FAIL]\033[0m'
+        fi
+        echo -n '   Persistent config: '
+        if [ -f /etc/modules-load.d/k8s.conf ] && grep -q overlay /etc/modules-load.d/k8s.conf && grep -q br_netfilter /etc/modules-load.d/k8s.conf; then
+            echo -e '\033[0;32m[PASS]\033[0m'
+        else
+            echo -e '\033[0;31m[FAIL]\033[0m'
+        fi
+        
+        echo ''
+        echo '4. Sysctl Settings:'
+        echo -n '   bridge-nf-call-iptables = 1: '
+        if [ \"\$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)\" = \"1\" ]; then 
+            echo -e '\033[0;32m[PASS]\033[0m'
+        else 
+            echo -e '\033[0;31m[FAIL]\033[0m'
+        fi
+        echo -n '   bridge-nf-call-ip6tables = 1: '
+        if [ \"\$(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null)\" = \"1\" ]; then 
+            echo -e '\033[0;32m[PASS]\033[0m'
+        else 
+            echo -e '\033[0;31m[FAIL]\033[0m'
+        fi
+        echo -n '   ip_forward = 1: '
+        if [ \"\$(sysctl -n net.ipv4.ip_forward 2>/dev/null)\" = \"1\" ]; then 
+            echo -e '\033[0;32m[PASS]\033[0m'
+        else 
+            echo -e '\033[0;31m[FAIL]\033[0m'
+        fi
+        echo -n '   Persistent config: '
+        if [ -f /etc/sysctl.d/k8s.conf ] && grep -q 'net.bridge.bridge-nf-call-iptables = 1' /etc/sysctl.d/k8s.conf; then
+            echo -e '\033[0;32m[PASS]\033[0m'
+        else
+            echo -e '\033[0;31m[FAIL]\033[0m'
+        fi
+        
+        echo ''
+        echo '5. Firewall:'
+        echo -n '   UFW status: '
+        if ufw status 2>/dev/null | grep -q 'Status: active'; then 
+            echo -e '\033[0;31m[FAIL] Active\033[0m'
+        else 
+            echo -e '\033[0;32m[PASS] Disabled\033[0m'
+        fi
+        
+        echo ''
+        echo '6. Kubernetes Packages:'
+        echo -n '   kubelet: '
+        dpkg -l kubelet 2>/dev/null | grep -q '^ii' && echo -e '\033[0;31m[FAIL] Installed\033[0m' || echo -e '\033[0;32m[PASS] Not installed\033[0m'
+        echo -n '   kubeadm: '
+        dpkg -l kubeadm 2>/dev/null | grep -q '^ii' && echo -e '\033[0;31m[FAIL] Installed\033[0m' || echo -e '\033[0;32m[PASS] Not installed\033[0m'
+        echo -n '   kubectl: '
+        dpkg -l kubectl 2>/dev/null | grep -q '^ii' && echo -e '\033[0;31m[FAIL] Installed\033[0m' || echo -e '\033[0;32m[PASS] Not installed\033[0m'
+        echo -n '   kubernetes-cni: '
+        dpkg -l kubernetes-cni 2>/dev/null | grep -q '^ii' && echo -e '\033[0;31m[FAIL] Installed\033[0m' || echo -e '\033[0;32m[PASS] Not installed\033[0m'
+        echo -n '   K8s apt sources: '
+        if ls /etc/apt/sources.list.d/kubernetes*.list 2>/dev/null | grep -q kubernetes; then
+            echo -e '\033[0;31m[FAIL] Found\033[0m'
+        else
+            echo -e '\033[0;32m[PASS] Clean\033[0m'
+        fi
+        
+        if [ \"\$NODE_TYPE\" = \"worker\" ]; then
+            echo ''
+            echo '7. Worker Storage Directories:'
+            for i in 1 2 3 4 5; do
+                echo -n \"   /mnt/local-storage/pv\$i: \"
+                if [ -d /mnt/local-storage/pv\$i ] && [ \"\$(stat -c %a /mnt/local-storage/pv\$i)\" = \"777\" ]; then
+                    echo -e '\033[0;32m[PASS]\033[0m'
+                else
+                    echo -e '\033[0;31m[FAIL]\033[0m'
+                fi
+            done
+            echo -n '   /mnt/prometheus: '
+            if [ -d /mnt/prometheus ] && [ \"\$(stat -c %a /mnt/prometheus)\" = \"777\" ]; then
+                echo -e '\033[0;32m[PASS]\033[0m'
+            else
+                echo -e '\033[0;31m[FAIL]\033[0m'
+            fi
+        fi
+    " || echo "ERROR: Cannot connect to $node"
     
     echo ""
-    return $result
 }
 
 # Main execution
-echo "=== Starting Cluster Validation ==="
-echo "Checking prerequisites for NKP deployment..."
+echo "=== Checking Prerequisites ==="
 echo ""
 
+# Loop through each control plane node individually
 for node in "${CONTROL_PLANE_IPS[@]}"; do
-    if ! check_node "$node" "control-plane"; then
-        FAILED_NODES=$((FAILED_NODES + 1))
-    fi
+    check_node "$node" "control-plane"
 done
 
+# Loop through each worker node individually
 for node in "${WORKER_IPS[@]}"; do
-    if ! check_node "$node" "worker"; then
-        FAILED_NODES=$((FAILED_NODES + 1))
-    fi
+    check_node "$node" "worker"
 done
 
-# Network test
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Network Validation"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -n "  VIP $VIP Status: "
-if ping -c 1 -W 2 "$VIP" &>/dev/null; then
-    echo -e "${RED}✗ IN USE (must be free!)${NC}"
-    TOTAL_ISSUES=$((TOTAL_ISSUES + 1))
-else
-    echo -e "${GREEN}✓ Available${NC}"
-fi
+echo "========================================="
+echo "Fix Commands (run on nodes that failed):"
+echo "========================================="
+cat << 'EOF'
 
-# Final summary
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "VALIDATION SUMMARY"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# 1. Create user (if not exists)
+sudo useradd -m -s /bin/bash nutanix
+sudo usermod -aG sudo nutanix
+echo "nutanix ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/nutanix
 
-if [ $TOTAL_ISSUES -eq 0 ]; then
-    echo -e "${GREEN}✓ CLUSTER READY${NC}"
-    echo "All nodes passed validation checks"
-else
-    echo -e "${RED}✗ CLUSTER NOT READY${NC}"
-    echo "Found $TOTAL_ISSUES total issue(s) across $FAILED_NODES node(s)"
-    echo ""
-    echo "Required fixes:"
-    echo "  • Disable swap: swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab"
-    echo "  • Load modules: modprobe overlay br_netfilter"
-    echo "  • Enable IP forward: sysctl -w net.ipv4.ip_forward=1"
-    echo "  • Configure bridge: sysctl -w net.bridge.bridge-nf-call-iptables=1"
-    echo "  • Disable firewall: ufw disable"
-    echo "  • Install containerd if missing"
-    echo "  • Create worker storage: mkdir -p /mnt/local-storage/pv{1..5} /mnt/prometheus"
-fi
+# 2. Disable swap
+sudo swapoff -a
+sudo sed -i '/ swap / s/^/#/' /etc/fstab
 
-echo ""
-echo "Deployment parameters for NKP:"
-first_cp="${CONTROL_PLANE_IPS[0]}"
-iface=$(run_cmd "$first_cp" "ip -4 route show default | grep -oP 'dev \K\S+'" || echo "eth0")
-echo "  --virtual-ip-interface $iface"
-echo "  --control-plane-endpoint-host $VIP"
-echo ""
-echo "Full report saved to: $REPORT_FILE"
+# 3. Load kernel modules
+sudo modprobe overlay
+sudo modprobe br_netfilter
+cat <<EOL | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOL
+
+# 4. Configure sysctl
+cat <<EOL | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOL
+sudo sysctl --system
+
+# 5. Disable firewall
+sudo ufw disable
+
+# 6. Clean up Kubernetes packages
+sudo apt-get remove -y kubelet kubeadm kubectl kubernetes-cni || true
+sudo rm -f /etc/apt/sources.list.d/kubernetes*.list
+sudo apt-get update
+
+# 7. Create storage directories (workers only)
+sudo mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5}
+sudo chmod 777 /mnt/local-storage/*
+sudo mkdir -p /mnt/prometheus
+sudo chmod 777 /mnt/prometheus
+
+EOF
+
+echo "Report saved to: $REPORT_FILE"
