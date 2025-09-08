@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# NKP Bare Metal Node Readiness Check Script v2.0
-# Enhanced for multi-node cluster validation
+# NKP Bare Metal Cluster Readiness Check Script v3.0
+# Centralized Pre-check Script - Run from operator/management VM
+# Performs remote validation of all cluster nodes via SSH
 # For Ubuntu 22.04 nodes preparing for Nutanix Kubernetes Platform deployment
 
 set -e
@@ -11,22 +12,25 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Script variables
-SCRIPT_VERSION="2.0"
-LOG_FILE="/tmp/nkp-readiness-check-$(date +%Y%m%d-%H%M%S).log"
+SCRIPT_VERSION="3.0"
+LOG_FILE="/tmp/nkp-cluster-check-$(date +%Y%m%d-%H%M%S).log"
 ERRORS_FOUND=0
+WARNINGS_FOUND=0
 
 # Cluster configuration variables
 CONTROL_PLANE_IPS=()
 WORKER_IPS=()
+ALL_NODE_IPS=()
 VIP=""
 CLUSTER_SUBNET=""
-CURRENT_NODE_IP=""
-CURRENT_NODE_TYPE=""
-CURRENT_HOSTNAME=""
-PRIMARY_INTERFACE=""
+DEPLOY_USER=""
+SSH_USER=""
+SSH_KEY=""
+NODE_INTERFACES=()
 
 # Function to print colored output
 print_status() {
@@ -41,23 +45,21 @@ print_status() {
             ;;
         "WARNING")
             echo -e "${YELLOW}[!]${NC} $message" | tee -a $LOG_FILE
+            WARNINGS_FOUND=$((WARNINGS_FOUND + 1))
             ;;
         "ERROR")
             echo -e "${RED}[✗]${NC} $message" | tee -a $LOG_FILE
             ERRORS_FOUND=$((ERRORS_FOUND + 1))
             ;;
         "HEADER")
-            echo -e "\n${BLUE}=== $message ===${NC}" | tee -a $LOG_FILE
+            echo -e "\n${CYAN}════════════════════════════════════════${NC}" | tee -a $LOG_FILE
+            echo -e "${CYAN}▶ $message${NC}" | tee -a $LOG_FILE
+            echo -e "${CYAN}════════════════════════════════════════${NC}" | tee -a $LOG_FILE
+            ;;
+        "NODE")
+            echo -e "\n${BLUE}┌─ Node: $message${NC}" | tee -a $LOG_FILE
             ;;
     esac
-}
-
-# Function to check if running as root or with sudo
-check_privileges() {
-    if [[ $EUID -ne 0 ]]; then
-        print_status "ERROR" "This script must be run as root or with sudo privileges"
-        exit 1
-    fi
 }
 
 # Function to validate IP address
@@ -70,9 +72,73 @@ validate_ip() {
     fi
 }
 
+# Function to test SSH connectivity
+test_ssh_connection() {
+    local ip=$1
+    local user=$2
+    local key_opt=""
+    
+    if [ ! -z "$SSH_KEY" ]; then
+        key_opt="-i $SSH_KEY"
+    fi
+    
+    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes $key_opt $user@$ip "echo connected" &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to execute command on remote node
+remote_exec() {
+    local ip=$1
+    local cmd=$2
+    local key_opt=""
+    
+    if [ ! -z "$SSH_KEY" ]; then
+        key_opt="-i $SSH_KEY"
+    fi
+    
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes $key_opt $SSH_USER@$ip "$cmd" 2>/dev/null
+}
+
+# Function to execute command with sudo on remote node
+remote_sudo_exec() {
+    local ip=$1
+    local cmd=$2
+    local key_opt=""
+    
+    if [ ! -z "$SSH_KEY" ]; then
+        key_opt="-i $SSH_KEY"
+    fi
+    
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes $key_opt $SSH_USER@$ip "sudo $cmd" 2>/dev/null
+}
+
 # Function to gather cluster configuration
 gather_cluster_config() {
-    print_status "HEADER" "Cluster Configuration"
+    print_status "HEADER" "Cluster Configuration Setup"
+    
+    # Get SSH user for connecting to nodes
+    echo -e "\n${YELLOW}Enter SSH username for connecting to cluster nodes:${NC}"
+    echo "This user must have sudo privileges on all nodes"
+    read -p "SSH Username: " SSH_USER
+    
+    # Get SSH key if available
+    echo -e "\n${YELLOW}Enter path to SSH private key (optional, press Enter to skip):${NC}"
+    read -p "SSH Key Path: " key_input
+    if [ ! -z "$key_input" ] && [ -f "$key_input" ]; then
+        SSH_KEY="$key_input"
+        print_status "SUCCESS" "SSH key found: $SSH_KEY"
+    elif [ ! -z "$key_input" ]; then
+        print_status "WARNING" "SSH key not found, will attempt password authentication"
+    fi
+    
+    # Get deployment user
+    echo -e "\n${YELLOW}Enter the username for NKP deployment:${NC}"
+    echo "This user will be created/verified on all nodes"
+    read -p "Deployment Username (default: nkp): " user_input
+    DEPLOY_USER=${user_input:-nkp}
     
     # Get control plane IPs
     echo -e "\n${YELLOW}Enter Control Plane node IPs (comma-separated):${NC}"
@@ -87,6 +153,7 @@ gather_cluster_config() {
             print_status "ERROR" "Invalid IP address: $ip"
             exit 1
         fi
+        ALL_NODE_IPS+=("$ip")
     done
     print_status "SUCCESS" "Control Plane nodes: ${#CONTROL_PLANE_IPS[@]} configured"
     
@@ -103,6 +170,7 @@ gather_cluster_config() {
             print_status "ERROR" "Invalid IP address: $ip"
             exit 1
         fi
+        ALL_NODE_IPS+=("$ip")
     done
     print_status "SUCCESS" "Worker nodes: ${#WORKER_IPS[@]} configured"
     
@@ -120,7 +188,9 @@ gather_cluster_config() {
     
     # Display configuration summary
     echo -e "\n${GREEN}Cluster Configuration Summary:${NC}"
-    echo "================================"
+    echo "════════════════════════════════════"
+    echo "SSH User: $SSH_USER"
+    echo "Deployment User: $DEPLOY_USER"
     echo "Control Plane nodes: ${CONTROL_PLANE_IPS[*]}"
     echo "Worker nodes: ${WORKER_IPS[*]}"
     echo "Virtual IP: $VIP"
@@ -135,455 +205,488 @@ gather_cluster_config() {
     fi
 }
 
-# Function to identify current node
-identify_current_node() {
-    print_status "HEADER" "Node Identification"
+# Function to test SSH connectivity to all nodes
+test_all_ssh_connections() {
+    print_status "HEADER" "Testing SSH Connectivity"
     
-    # Get current hostname
-    CURRENT_HOSTNAME=$(hostname)
-    print_status "INFO" "Current hostname: $CURRENT_HOSTNAME"
+    local ssh_failed=0
     
-    # Get all IPs on this node
-    local node_ips=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1')
-    
-    print_status "INFO" "Detecting node type based on configured IPs..."
-    
-    # Check if this node is a control plane
-    for ip in $node_ips; do
-        for cp_ip in "${CONTROL_PLANE_IPS[@]}"; do
-            cp_ip=$(echo $cp_ip | xargs)
-            if [[ "$ip" == "$cp_ip" ]]; then
-                CURRENT_NODE_IP=$ip
-                CURRENT_NODE_TYPE="control-plane"
-                print_status "SUCCESS" "This is a CONTROL PLANE node with IP: $CURRENT_NODE_IP"
-                return
-            fi
-        done
-    done
-    
-    # Check if this node is a worker
-    for ip in $node_ips; do
-        for worker_ip in "${WORKER_IPS[@]}"; do
-            worker_ip=$(echo $worker_ip | xargs)
-            if [[ "$ip" == "$worker_ip" ]]; then
-                CURRENT_NODE_IP=$ip
-                CURRENT_NODE_TYPE="worker"
-                print_status "SUCCESS" "This is a WORKER node with IP: $CURRENT_NODE_IP"
-                return
-            fi
-        done
-    done
-    
-    # Node not found in configuration
-    print_status "ERROR" "This node's IP is not in the cluster configuration!"
-    echo "Node IPs found: $node_ips"
-    echo "Please verify the cluster configuration."
-    exit 1
-}
-
-# Function to display network interfaces
-display_network_interfaces() {
-    print_status "HEADER" "Network Interfaces"
-    
-    # Get all network interfaces
-    interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo)
-    
-    echo "Available network interfaces on this node:"
-    for iface in $interfaces; do
-        ip_addr=$(ip -4 addr show $iface | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-        mac_addr=$(ip link show $iface | grep -oP '(?<=link/ether\s)[a-f0-9:]+' | head -1)
-        state=$(ip link show $iface | grep -oP '(?<=state\s)\w+' | head -1)
+    for ip in "${ALL_NODE_IPS[@]}"; do
+        ip=$(echo $ip | xargs)
+        echo -n "Testing SSH to $ip... "
         
-        echo -e "\n  Interface: ${GREEN}$iface${NC}"
-        echo "    State: $state"
-        echo "    IP: ${ip_addr:-Not configured}"
-        echo "    MAC: ${mac_addr:-N/A}"
-        
-        # Check if this interface has the current node IP
-        if [ "$ip_addr" == "$CURRENT_NODE_IP" ]; then
-            echo -e "    ${YELLOW}*** Primary interface for this node ***${NC}"
-            PRIMARY_INTERFACE=$iface
+        if test_ssh_connection "$ip" "$SSH_USER"; then
+            echo -e "${GREEN}✓ Connected${NC}"
+            
+            # Test sudo access
+            if remote_exec "$ip" "sudo -n echo test" &>/dev/null; then
+                echo "  └─ Sudo access: ${GREEN}✓ Passwordless${NC}"
+            else
+                echo "  └─ Sudo access: ${YELLOW}! Requires password${NC}"
+                print_status "WARNING" "Node $ip requires sudo password"
+            fi
+        else
+            echo -e "${RED}✗ Failed${NC}"
+            print_status "ERROR" "Cannot connect to $ip via SSH"
+            ssh_failed=$((ssh_failed + 1))
         fi
     done
     
-    if [ ! -z "$PRIMARY_INTERFACE" ]; then
-        echo -e "\n${GREEN}Primary Interface Detected: $PRIMARY_INTERFACE${NC}"
-        echo -e "${YELLOW}Use '--virtual-ip-interface $PRIMARY_INTERFACE' in NKP deployment${NC}"
+    if [ $ssh_failed -gt 0 ]; then
+        print_status "ERROR" "SSH connection failed to $ssh_failed node(s)"
+        echo -e "\n${YELLOW}Please ensure:${NC}"
+        echo "1. SSH service is running on all nodes"
+        echo "2. User '$SSH_USER' exists on all nodes"
+        echo "3. SSH key or password authentication is configured"
+        echo "4. No firewall is blocking SSH (port 22)"
+        exit 1
     else
-        print_status "WARNING" "Could not detect primary interface"
+        print_status "SUCCESS" "SSH connectivity verified to all nodes"
     fi
 }
 
-# Function to check and create user
-check_create_user() {
-    print_status "HEADER" "User Configuration"
+# Function to check node prerequisites
+check_node_prerequisites() {
+    local ip=$1
+    local node_type=$2
     
-    # Check if nkp user exists
-    if id "nkp" &>/dev/null; then
-        print_status "SUCCESS" "User 'nkp' exists"
-    else
-        print_status "INFO" "Creating user 'nkp'..."
-        useradd -m -s /bin/bash nkp
-        echo "nkp:nkp@k8s2024" | chpasswd
-        print_status "SUCCESS" "User 'nkp' created with default password"
-        print_status "WARNING" "Default password set to 'nkp@k8s2024' - Please change it!"
+    print_status "NODE" "$ip ($node_type)"
+    
+    # Get hostname
+    local hostname=$(remote_exec "$ip" "hostname")
+    echo "  Hostname: $hostname"
+    
+    # Get network interfaces and find primary
+    echo "  Network Interfaces:"
+    local interfaces=$(remote_exec "$ip" "ip -o -4 addr show | grep -v '127.0.0.1'")
+    local primary_iface=""
+    
+    while IFS= read -r line; do
+        if [ ! -z "$line" ]; then
+            local iface=$(echo $line | awk '{print $2}')
+            local addr=$(echo $line | awk '{print $4}' | cut -d'/' -f1)
+            
+            if [ "$addr" == "$ip" ]; then
+                primary_iface=$iface
+                echo "    └─ ${GREEN}$iface: $addr (PRIMARY)${NC}"
+                NODE_INTERFACES+=("$ip:$iface")
+            else
+                echo "    └─ $iface: $addr"
+            fi
+        fi
+    done <<< "$interfaces"
+    
+    if [ -z "$primary_iface" ]; then
+        print_status "ERROR" "Could not determine primary interface for $ip"
     fi
     
-    # Check sudoers
-    if sudo -l -U nkp 2>/dev/null | grep -q "NOPASSWD: ALL"; then
-        print_status "SUCCESS" "User 'nkp' has passwordless sudo access"
+    # Check swap
+    echo -n "  Swap Status: "
+    if remote_exec "$ip" "swapon -s | grep -q '^/'" ; then
+        echo -e "${RED}✗ Enabled${NC}"
+        print_status "WARNING" "Swap is enabled on $ip"
     else
-        print_status "INFO" "Adding 'nkp' to sudoers..."
-        echo "nkp ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/nkp
-        print_status "SUCCESS" "User 'nkp' added to sudoers"
+        echo -e "${GREEN}✓ Disabled${NC}"
     fi
     
-    # Setup SSH key for nkp user (if not exists)
-    if [ ! -f /home/nkp/.ssh/id_rsa ]; then
-        print_status "INFO" "Generating SSH key for nkp user"
-        sudo -u nkp ssh-keygen -t rsa -b 4096 -f /home/nkp/.ssh/id_rsa -N "" -q
-        print_status "SUCCESS" "SSH key generated for nkp user"
+    # Check kernel modules
+    echo -n "  Kernel Modules: "
+    local modules_ok=true
+    for module in overlay br_netfilter; do
+        if ! remote_exec "$ip" "lsmod | grep -q $module"; then
+            modules_ok=false
+        fi
+    done
+    
+    if $modules_ok; then
+        echo -e "${GREEN}✓ Loaded${NC}"
     else
-        print_status "SUCCESS" "SSH key already exists for nkp user"
+        echo -e "${YELLOW}! Missing${NC}"
+        print_status "WARNING" "Required kernel modules not loaded on $ip"
+    fi
+    
+    # Check sysctl settings
+    echo -n "  IP Forwarding: "
+    local ipforward=$(remote_exec "$ip" "sysctl -n net.ipv4.ip_forward")
+    if [ "$ipforward" = "1" ]; then
+        echo -e "${GREEN}✓ Enabled${NC}"
+    else
+        echo -e "${YELLOW}! Disabled${NC}"
+        print_status "WARNING" "IP forwarding disabled on $ip"
+    fi
+    
+    # Check firewall
+    echo -n "  Firewall: "
+    if remote_exec "$ip" "systemctl is-active ufw" | grep -q "active"; then
+        echo -e "${YELLOW}! Active${NC}"
+        print_status "WARNING" "UFW firewall is active on $ip"
+    else
+        echo -e "${GREEN}✓ Disabled${NC}"
+    fi
+    
+    # Check deployment user
+    echo -n "  User '$DEPLOY_USER': "
+    if remote_exec "$ip" "id $DEPLOY_USER" &>/dev/null; then
+        echo -e "${GREEN}✓ Exists${NC}"
+        
+        # Check sudo access
+        echo -n "    └─ Sudo: "
+        if remote_exec "$ip" "sudo -l -U $DEPLOY_USER" | grep -q "NOPASSWD: ALL"; then
+            echo -e "${GREEN}✓ Passwordless${NC}"
+        else
+            echo -e "${YELLOW}! Not configured${NC}"
+            print_status "WARNING" "User $DEPLOY_USER needs sudo configuration on $ip"
+        fi
+    else
+        echo -e "${YELLOW}! Does not exist${NC}"
+        print_status "WARNING" "User $DEPLOY_USER needs to be created on $ip"
+    fi
+    
+    # Check storage directories for worker nodes
+    if [ "$node_type" = "worker" ]; then
+        echo -n "  Storage Directories: "
+        if remote_exec "$ip" "ls -d /mnt/local-storage/pv1 2>/dev/null" &>/dev/null; then
+            echo -e "${GREEN}✓ Configured${NC}"
+        else
+            echo -e "${YELLOW}! Not configured${NC}"
+            print_status "WARNING" "Storage directories need to be created on worker $ip"
+        fi
+    fi
+    
+    # Check container runtime
+    echo -n "  Container Runtime: "
+    if remote_exec "$ip" "docker --version" &>/dev/null; then
+        echo -e "${GREEN}✓ Docker installed${NC}"
+    elif remote_exec "$ip" "containerd --version" &>/dev/null; then
+        echo -e "${GREEN}✓ Containerd installed${NC}"
+    else
+        echo -e "${YELLOW}! Not installed${NC}"
+        print_status "WARNING" "No container runtime found on $ip"
     fi
 }
 
-# Function to disable swap
-disable_swap() {
-    print_status "HEADER" "System Configuration - Swap"
+# Function to fix node issues
+fix_node_issues() {
+    local ip=$1
+    local node_type=$2
     
-    # Check current swap status
-    if [ $(swapon -s | wc -l) -gt 1 ]; then
-        swapoff -a
-        sed -i '/ swap / s/^/#/' /etc/fstab
-        print_status "SUCCESS" "Swap disabled"
-    else
-        print_status "SUCCESS" "Swap already disabled"
+    print_status "INFO" "Attempting to fix issues on $ip..."
+    
+    # Create deployment user if needed
+    if ! remote_exec "$ip" "id $DEPLOY_USER" &>/dev/null; then
+        print_status "INFO" "Creating user $DEPLOY_USER on $ip"
+        remote_sudo_exec "$ip" "useradd -m -s /bin/bash $DEPLOY_USER"
+        remote_sudo_exec "$ip" "echo '$DEPLOY_USER:$DEPLOY_USER@k8s2025' | chpasswd"
+        remote_sudo_exec "$ip" "echo '$DEPLOY_USER ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$DEPLOY_USER"
+        remote_sudo_exec "$ip" "chmod 440 /etc/sudoers.d/$DEPLOY_USER"
+        
+        # Generate SSH key
+        remote_sudo_exec "$ip" "sudo -u $DEPLOY_USER ssh-keygen -t rsa -b 4096 -f /home/$DEPLOY_USER/.ssh/id_rsa -N '' -q"
     fi
     
-    # Verify
-    if free | grep -q "Swap:.*0.*0.*0"; then
-        print_status "SUCCESS" "Swap verification passed"
-    else
-        print_status "ERROR" "Swap is still active"
-    fi
-}
-
-# Function to load kernel modules
-load_kernel_modules() {
-    print_status "HEADER" "Kernel Modules"
+    # Disable swap
+    print_status "INFO" "Disabling swap on $ip"
+    remote_sudo_exec "$ip" "swapoff -a"
+    remote_sudo_exec "$ip" "sed -i '/ swap / s/^/#/' /etc/fstab"
     
-    # Load required modules
-    modprobe overlay
-    modprobe br_netfilter
-    
-    # Make persistent
-    cat <<EOF > /etc/modules-load.d/k8s.conf
+    # Load kernel modules
+    print_status "INFO" "Loading kernel modules on $ip"
+    remote_sudo_exec "$ip" "modprobe overlay"
+    remote_sudo_exec "$ip" "modprobe br_netfilter"
+    remote_sudo_exec "$ip" "cat > /etc/modules-load.d/k8s.conf <<EOF
 overlay
 br_netfilter
-EOF
+EOF"
     
-    # Verify modules are loaded
-    if lsmod | grep -q overlay && lsmod | grep -q br_netfilter; then
-        print_status "SUCCESS" "Kernel modules loaded successfully"
-    else
-        print_status "ERROR" "Failed to load kernel modules"
-    fi
-}
-
-# Function to configure sysctl
-configure_sysctl() {
-    print_status "HEADER" "Sysctl Parameters"
-    
-    cat <<EOF > /etc/sysctl.d/k8s.conf
+    # Configure sysctl
+    print_status "INFO" "Configuring sysctl on $ip"
+    remote_sudo_exec "$ip" "cat > /etc/sysctl.d/k8s.conf <<EOF
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward = 1
-EOF
+EOF"
+    remote_sudo_exec "$ip" "sysctl --system"
     
-    sysctl --system &>/dev/null
+    # Disable firewall
+    print_status "INFO" "Disabling firewall on $ip"
+    remote_sudo_exec "$ip" "ufw disable"
+    remote_sudo_exec "$ip" "systemctl stop ufw"
+    remote_sudo_exec "$ip" "systemctl disable ufw"
     
-    # Verify settings
-    if [ "$(sysctl -n net.bridge.bridge-nf-call-iptables)" = "1" ] && \
-       [ "$(sysctl -n net.bridge.bridge-nf-call-ip6tables)" = "1" ] && \
-       [ "$(sysctl -n net.ipv4.ip_forward)" = "1" ]; then
-        print_status "SUCCESS" "Sysctl parameters configured correctly"
-    else
-        print_status "ERROR" "Failed to configure sysctl parameters"
+    # Clean Kubernetes packages
+    print_status "INFO" "Cleaning Kubernetes packages on $ip"
+    remote_sudo_exec "$ip" "apt-get remove -y kubelet kubeadm kubectl kubernetes-cni || true"
+    remote_sudo_exec "$ip" "rm -f /etc/apt/sources.list.d/kubernetes*.list"
+    
+    # Create storage directories for workers
+    if [ "$node_type" = "worker" ]; then
+        print_status "INFO" "Creating storage directories on worker $ip"
+        remote_sudo_exec "$ip" "mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5}"
+        remote_sudo_exec "$ip" "chmod 777 /mnt/local-storage/*"
+        remote_sudo_exec "$ip" "mkdir -p /mnt/prometheus"
+        remote_sudo_exec "$ip" "chmod 777 /mnt/prometheus"
     fi
-}
-
-# Function to disable firewall
-disable_firewall() {
-    print_status "HEADER" "Firewall Configuration"
     
-    if systemctl is-active --quiet ufw; then
-        ufw disable &>/dev/null
-        systemctl stop ufw
-        systemctl disable ufw &>/dev/null
-        print_status "SUCCESS" "UFW firewall disabled"
-    else
-        print_status "SUCCESS" "UFW firewall already disabled"
-    fi
+    print_status "SUCCESS" "Fixes applied to $ip"
 }
 
-# Function to clean Kubernetes packages
-clean_kubernetes_packages() {
-    print_status "HEADER" "Kubernetes Package Cleanup"
-    
-    # Remove any existing k8s packages
-    apt-get remove -y kubelet kubeadm kubectl kubernetes-cni &>/dev/null || true
-    rm -f /etc/apt/sources.list.d/kubernetes*.list
-    apt-get update &>/dev/null
-    
-    print_status "SUCCESS" "Kubernetes packages cleaned"
-}
-
-# Function to create storage directories (for worker nodes)
-create_storage_directories() {
-    if [[ "$CURRENT_NODE_TYPE" == "worker" ]]; then
-        print_status "HEADER" "Storage Directories (Worker Node)"
-        
-        # Create local storage directories
-        mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5}
-        chmod 777 /mnt/local-storage/*
-        
-        # Create prometheus directory
-        mkdir -p /mnt/prometheus
-        chmod 777 /mnt/prometheus
-        
-        print_status "SUCCESS" "Storage directories created"
-        
-        # List created directories
-        echo "Created directories:"
-        ls -ld /mnt/local-storage/pv* | head -5
-        ls -ld /mnt/prometheus
-    fi
-}
-
-# Function to test cluster network connectivity
+# Function to test cluster connectivity
 test_cluster_connectivity() {
     print_status "HEADER" "Cluster Network Connectivity"
     
     # Check VIP availability
-    print_status "INFO" "Checking VIP availability..."
+    print_status "INFO" "Checking VIP availability from operator VM..."
     if ping -c 1 -W 2 $VIP &>/dev/null; then
         print_status "WARNING" "VIP $VIP is already in use! This should be unused."
     else
         print_status "SUCCESS" "VIP $VIP is not in use (as expected)"
     fi
     
-    # Check connectivity to cluster subnet
-    print_status "INFO" "Checking connectivity to cluster subnet $CLUSTER_SUBNET"
+    # Test inter-node connectivity
+    print_status "INFO" "Testing inter-node connectivity..."
     
-    # Extract network address from CIDR
-    network_addr=$(echo $CLUSTER_SUBNET | cut -d'/' -f1)
-    
-    # Try to get route to network
-    if ip route get $network_addr &>/dev/null; then
-        print_status "SUCCESS" "Route to cluster subnet exists"
-    else
-        print_status "WARNING" "No direct route to cluster subnet $CLUSTER_SUBNET"
-    fi
-    
-    # Test connectivity to other cluster nodes
-    print_status "INFO" "Testing connectivity to cluster nodes..."
-    
-    echo -e "\nControl Plane nodes connectivity:"
-    for cp_ip in "${CONTROL_PLANE_IPS[@]}"; do
-        cp_ip=$(echo $cp_ip | xargs)
-        if ping -c 1 -W 2 $cp_ip &>/dev/null; then
-            echo -e "  $cp_ip: ${GREEN}✓ Reachable${NC}"
-        else
-            echo -e "  $cp_ip: ${RED}✗ Unreachable${NC}"
-            if [[ "$cp_ip" != "$CURRENT_NODE_IP" ]]; then
-                print_status "WARNING" "Cannot reach control plane node $cp_ip"
-            fi
-        fi
+    echo -e "\n${CYAN}Connectivity Matrix:${NC}"
+    echo -n "From/To     "
+    for target_ip in "${ALL_NODE_IPS[@]}"; do
+        target_ip=$(echo $target_ip | xargs)
+        printf "%-15s " "$target_ip"
     done
+    echo ""
     
-    echo -e "\nWorker nodes connectivity:"
-    for worker_ip in "${WORKER_IPS[@]}"; do
-        worker_ip=$(echo $worker_ip | xargs)
-        if ping -c 1 -W 2 $worker_ip &>/dev/null; then
-            echo -e "  $worker_ip: ${GREEN}✓ Reachable${NC}"
-        else
-            echo -e "  $worker_ip: ${RED}✗ Unreachable${NC}"
-            if [[ "$worker_ip" != "$CURRENT_NODE_IP" ]]; then
-                print_status "WARNING" "Cannot reach worker node $worker_ip"
+    for source_ip in "${ALL_NODE_IPS[@]}"; do
+        source_ip=$(echo $source_ip | xargs)
+        printf "%-12s" "$source_ip"
+        
+        for target_ip in "${ALL_NODE_IPS[@]}"; do
+            target_ip=$(echo $target_ip | xargs)
+            if [ "$source_ip" == "$target_ip" ]; then
+                printf "%-15s " "---"
+            else
+                if remote_exec "$source_ip" "ping -c 1 -W 1 $target_ip" &>/dev/null; then
+                    printf "${GREEN}%-15s${NC} " "✓"
+                else
+                    printf "${RED}%-15s${NC} " "✗"
+                    print_status "WARNING" "$source_ip cannot reach $target_ip"
+                fi
             fi
-        fi
+        done
+        echo ""
     done
 }
 
-# Function to test container registry access
+# Function to test registry access from nodes
 test_registry_access() {
     print_status "HEADER" "Container Registry Access"
     
-    # List of critical registries for NKP
+    # Test from first control plane node
+    local test_node=${CONTROL_PLANE_IPS[0]}
+    test_node=$(echo $test_node | xargs)
+    
+    print_status "INFO" "Testing registry access from $test_node"
+    
     declare -a registries=(
         "docker.io"
         "gcr.io"
         "registry.k8s.io"
         "quay.io"
         "ghcr.io"
-        "nvcr.io"
-        "mcr.microsoft.com"
     )
-    
-    echo "Testing registry connectivity:"
-    local failed_registries=0
     
     for registry in "${registries[@]}"; do
-        if timeout 5 curl -s -o /dev/null -w "%{http_code}" https://$registry 2>/dev/null | grep -q "200\|301\|302\|401\|403"; then
-            echo -e "  $registry: ${GREEN}✓ Accessible${NC}"
+        echo -n "  $registry: "
+        if remote_exec "$test_node" "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 https://$registry" | grep -q "200\|301\|302\|401\|403"; then
+            echo -e "${GREEN}✓ Accessible${NC}"
         else
-            echo -e "  $registry: ${RED}✗ Not accessible${NC}"
-            failed_registries=$((failed_registries + 1))
+            echo -e "${RED}✗ Not accessible${NC}"
+            print_status "WARNING" "Cannot reach $registry from cluster nodes"
         fi
     done
-    
-    if [ $failed_registries -eq 0 ]; then
-        print_status "SUCCESS" "All container registries accessible"
-    else
-        print_status "WARNING" "$failed_registries registries not accessible"
-    fi
-    
-    # Test pulling a small image (if docker/containerd is installed)
-    if command -v docker &> /dev/null; then
-        print_status "INFO" "Testing image pull with Docker..."
-        if docker pull alpine:latest &>/dev/null; then
-            print_status "SUCCESS" "Successfully pulled test image (alpine:latest)"
-            docker rmi alpine:latest &>/dev/null
-        else
-            print_status "ERROR" "Failed to pull test image"
-        fi
-    elif command -v crictl &> /dev/null; then
-        print_status "INFO" "Testing image pull with crictl..."
-        if crictl pull alpine:latest &>/dev/null; then
-            print_status "SUCCESS" "Successfully pulled test image (alpine:latest)"
-        else
-            print_status "ERROR" "Failed to pull test image"
-        fi
-    else
-        print_status "INFO" "No container runtime found - skipping image pull test"
-    fi
 }
 
-# Function to test helm repository access
-test_helm_repo_access() {
-    print_status "HEADER" "Helm Repository Access"
+# Function to generate deployment script
+generate_deployment_script() {
+    print_status "HEADER" "Generating Deployment Script"
     
-    # Critical helm repositories for NKP
-    declare -a helm_repos=(
-        "charts.bitnami.com"
-        "charts.jetstack.io"
-        "grafana.github.io"
-        "prometheus-community.github.io"
-        "kubernetes.github.io"
-        "mesosphere.github.io"
-    )
+    # Find primary interface for first control plane
+    local first_cp=${CONTROL_PLANE_IPS[0]}
+    first_cp=$(echo $first_cp | xargs)
+    local primary_iface=""
     
-    echo "Testing Helm repository connectivity:"
-    local failed_repos=0
-    
-    for repo in "${helm_repos[@]}"; do
-        if timeout 5 curl -s -o /dev/null -w "%{http_code}" https://$repo 2>/dev/null | grep -q "200\|301\|302\|403\|404"; then
-            echo -e "  $repo: ${GREEN}✓ Accessible${NC}"
-        else
-            echo -e "  $repo: ${RED}✗ Not accessible${NC}"
-            failed_repos=$((failed_repos + 1))
+    for entry in "${NODE_INTERFACES[@]}"; do
+        if [[ $entry == $first_cp:* ]]; then
+            primary_iface=${entry#*:}
+            break
         fi
     done
     
-    if [ $failed_repos -eq 0 ]; then
-        print_status "SUCCESS" "All Helm repositories accessible"
-    else
-        print_status "WARNING" "$failed_repos Helm repositories not accessible"
+    if [ -z "$primary_iface" ]; then
+        print_status "WARNING" "Could not determine primary interface, using default 'eth0'"
+        primary_iface="eth0"
     fi
+    
+    # Create deployment script
+    cat > /tmp/nkp-deploy.sh <<EOF
+#!/bin/bash
+# NKP Deployment Script
+# Generated on $(date)
+
+echo "Starting NKP deployment..."
+
+nkp create cluster preprovisioned \\
+  --cluster-name nkp-poc \\
+  --control-plane-endpoint-host $VIP \\
+  --virtual-ip-interface $primary_iface \\
+  --control-plane-replicas ${#CONTROL_PLANE_IPS[@]} \\
+  --worker-replicas ${#WORKER_IPS[@]} \\
+  --namespace default
+
+echo "Deployment command executed."
+echo "Monitor the deployment with: nkp describe cluster nkp-poc"
+EOF
+    
+    chmod +x /tmp/nkp-deploy.sh
+    
+    echo -e "\n${GREEN}Deployment script generated: /tmp/nkp-deploy.sh${NC}"
+    echo -e "\n${YELLOW}NKP Deployment Command:${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    cat /tmp/nkp-deploy.sh | grep -A10 "nkp create"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "\n${CYAN}Note: Virtual IP interface set to '$primary_iface'${NC}"
+    echo "If this is incorrect, edit /tmp/nkp-deploy.sh before running"
 }
 
 # Function to generate summary report
 generate_summary() {
-    print_status "HEADER" "Summary Report"
+    print_status "HEADER" "Cluster Readiness Summary"
     
     echo -e "\n${BLUE}════════════════════════════════════════${NC}"
-    echo -e "${BLUE}     Node Readiness Check Complete      ${NC}"
+    echo -e "${BLUE}     Cluster Validation Complete         ${NC}"
     echo -e "${BLUE}════════════════════════════════════════${NC}"
     
     echo -e "\n${GREEN}Cluster Configuration:${NC}"
-    echo "├─ Deployment User: $DEPLOY_USER"
     echo "├─ Control Plane: ${#CONTROL_PLANE_IPS[@]} nodes"
     echo "├─ Workers: ${#WORKER_IPS[@]} nodes"
     echo "├─ VIP: $VIP"
-    echo "└─ Subnet: $CLUSTER_SUBNET"
+    echo "├─ Subnet: $CLUSTER_SUBNET"
+    echo "└─ Deployment User: $DEPLOY_USER"
     
-    echo -e "\n${GREEN}Current Node:${NC}"
-    echo "├─ Hostname: $CURRENT_HOSTNAME"
-    echo "├─ IP: $CURRENT_NODE_IP"
-    echo "├─ Type: $CURRENT_NODE_TYPE"
-    echo "└─ Primary Interface: ${PRIMARY_INTERFACE:-Not detected}"
+    echo -e "\n${GREEN}Node Summary:${NC}"
+    for ip in "${CONTROL_PLANE_IPS[@]}"; do
+        ip=$(echo $ip | xargs)
+        echo "├─ Control Plane: $ip"
+    done
+    for ip in "${WORKER_IPS[@]}"; do
+        ip=$(echo $ip | xargs)
+        echo "├─ Worker: $ip"
+    done
     
     echo ""
-    if [ $ERRORS_FOUND -eq 0 ]; then
+    if [ $ERRORS_FOUND -eq 0 ] && [ $WARNINGS_FOUND -eq 0 ]; then
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${GREEN}✓ All checks passed!${NC}"
-        echo -e "${GREEN}  Node is ready for NKP deployment${NC}"
+        echo -e "${GREEN}  Cluster is ready for NKP deployment${NC}"
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    elif [ $ERRORS_FOUND -eq 0 ]; then
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${YELLOW}⚠ Found $WARNINGS_FOUND warning(s)${NC}"
+        echo -e "${YELLOW}  Review warnings before deployment${NC}"
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     else
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${RED}✗ Found $ERRORS_FOUND error(s)${NC}"
-        echo -e "${RED}  Please fix these before proceeding${NC}"
+        echo -e "${RED}✗ Found $ERRORS_FOUND error(s) and $WARNINGS_FOUND warning(s)${NC}"
+        echo -e "${RED}  Fix errors before proceeding${NC}"
         echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     fi
     
-    # Provide deployment command template
-    if [[ "$CURRENT_NODE_TYPE" == "control-plane" ]] && [ ! -z "$PRIMARY_INTERFACE" ]; then
-        echo -e "\n${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${YELLOW}Deployment Command Template:${NC}"
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo ""
-        echo "nkp create cluster preprovisioned \\"
-        echo "  --cluster-name nkp-poc \\"
-        echo "  --control-plane-endpoint-host $VIP \\"
-        echo -e "  ${GREEN}--virtual-ip-interface $PRIMARY_INTERFACE${NC} \\"
-        echo "  --control-plane-replicas ${#CONTROL_PLANE_IPS[@]} \\"
-        echo "  --worker-replicas ${#WORKER_IPS[@]} \\"
-        echo "  --namespace default"
+    echo -e "\n${CYAN}Next Steps:${NC}"
+    if [ $ERRORS_FOUND -eq 0 ]; then
+        echo "1. Review the deployment script: /tmp/nkp-deploy.sh"
+        echo "2. Ensure NKP CLI is installed on this operator VM"
+        echo "3. Run the deployment: bash /tmp/nkp-deploy.sh"
+        echo "4. Monitor deployment: nkp describe cluster nkp-poc"
+    else
+        echo "1. Fix the errors identified above"
+        echo "2. Run this script again to verify fixes"
+        echo "3. Proceed with deployment once all checks pass"
     fi
     
     echo -e "\n${BLUE}Log file: $LOG_FILE${NC}"
 }
 
-# Function to perform all checks
+# Function to run all checks
 run_all_checks() {
-    identify_current_node
-    display_network_interfaces
-    check_create_user
-    disable_swap
-    load_kernel_modules
-    configure_sysctl
-    disable_firewall
-    clean_kubernetes_packages
-    create_storage_directories
+    # Test SSH connectivity first
+    test_all_ssh_connections
+    
+    # Check prerequisites on all nodes
+    print_status "HEADER" "Node Prerequisites Check"
+    
+    for ip in "${CONTROL_PLANE_IPS[@]}"; do
+        ip=$(echo $ip | xargs)
+        check_node_prerequisites "$ip" "control-plane"
+    done
+    
+    for ip in "${WORKER_IPS[@]}"; do
+        ip=$(echo $ip | xargs)
+        check_node_prerequisites "$ip" "worker"
+    done
+    
+    # Ask if user wants to fix issues
+    if [ $WARNINGS_FOUND -gt 0 ] || [ $ERRORS_FOUND -gt 0 ]; then
+        echo ""
+        read -p "Do you want to automatically fix the issues found? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            print_status "HEADER" "Applying Fixes to Nodes"
+            
+            for ip in "${CONTROL_PLANE_IPS[@]}"; do
+                ip=$(echo $ip | xargs)
+                fix_node_issues "$ip" "control-plane"
+            done
+            
+            for ip in "${WORKER_IPS[@]}"; do
+                ip=$(echo $ip | xargs)
+                fix_node_issues "$ip" "worker"
+            done
+            
+            print_status "SUCCESS" "All fixes applied. Re-checking nodes..."
+            
+            # Reset counters and re-check
+            ERRORS_FOUND=0
+            WARNINGS_FOUND=0
+            
+            for ip in "${CONTROL_PLANE_IPS[@]}"; do
+                ip=$(echo $ip | xargs)
+                check_node_prerequisites "$ip" "control-plane"
+            done
+            
+            for ip in "${WORKER_IPS[@]}"; do
+                ip=$(echo $ip | xargs)
+                check_node_prerequisites "$ip" "worker"
+            done
+        fi
+    fi
+    
+    # Test cluster connectivity
     test_cluster_connectivity
+    
+    # Test registry access
     test_registry_access
-    test_helm_repo_access
+    
+    # Generate deployment script
+    generate_deployment_script
 }
 
 # Main execution
 main() {
     clear
-    echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║   NKP Bare Metal Node Readiness Check v$SCRIPT_VERSION   ║${NC}"
-    echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  NKP Cluster Readiness Check v$SCRIPT_VERSION - Centralized  ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo "This script will verify node readiness for NKP deployment"
-    echo "and validate cluster-wide configuration."
+    echo "This script runs from your operator/management VM and"
+    echo "performs remote validation of all cluster nodes via SSH."
     echo ""
-    
-    # Check privileges
-    check_privileges
     
     # Gather cluster configuration
     gather_cluster_config
