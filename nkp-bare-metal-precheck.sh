@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# NKP Bare Metal Precheck and Validation Script
+# NKP Bare Metal Infrastructure Validation Script - Read Only
 # Version: 1.0
 # This script validates infrastructure readiness for NKP deployment
 
@@ -16,10 +16,11 @@ NC='\033[0m' # No Color
 # Arrays to store IPs
 declare -a CONTROL_PLANE_IPS
 declare -a WORKER_IPS
+declare -a HOSTNAMES
 
 # Validation results
 VALIDATION_PASSED=true
-VALIDATION_REPORT="validation-report.txt"
+VALIDATION_REPORT="validation-report-$(date +%Y%m%d-%H%M%S).txt"
 
 # Function to print colored output
 print_msg() {
@@ -69,10 +70,22 @@ check_node_prereqs() {
     local os_info=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "lsb_release -d 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME" 2>/dev/null || echo "Unknown")
     print_msg "$BLUE" "  OS: $os_info"
     
+    # Check user sudo privileges
+    ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "sudo -n true" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        print_msg "$RED" "  ✗ FAIL: User $user cannot sudo without password"
+        print_msg "$YELLOW" "    Fix: echo '$user ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/$user"
+        node_passed=false
+        VALIDATION_PASSED=false
+    else
+        print_msg "$GREEN" "  ✓ PASS: User has passwordless sudo"
+    fi
+    
     # Check swap
     local swap_status=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "swapon -s | wc -l" 2>/dev/null)
     if [ "$swap_status" -gt 1 ]; then
         print_msg "$RED" "  ✗ FAIL: Swap is enabled"
+        print_msg "$YELLOW" "    Fix: sudo swapoff -a && sudo sed -i '/ swap / s/^/#/' /etc/fstab"
         node_passed=false
         VALIDATION_PASSED=false
     else
@@ -85,6 +98,7 @@ check_node_prereqs() {
     
     if [ "$overlay_loaded" -eq 0 ]; then
         print_msg "$RED" "  ✗ FAIL: Overlay kernel module not loaded"
+        print_msg "$YELLOW" "    Fix: sudo modprobe overlay && echo 'overlay' | sudo tee -a /etc/modules-load.d/k8s.conf"
         node_passed=false
         VALIDATION_PASSED=false
     else
@@ -93,6 +107,7 @@ check_node_prereqs() {
     
     if [ "$br_netfilter_loaded" -eq 0 ]; then
         print_msg "$RED" "  ✗ FAIL: br_netfilter kernel module not loaded"
+        print_msg "$YELLOW" "    Fix: sudo modprobe br_netfilter && echo 'br_netfilter' | sudo tee -a /etc/modules-load.d/k8s.conf"
         node_passed=false
         VALIDATION_PASSED=false
     else
@@ -102,15 +117,72 @@ check_node_prereqs() {
     # Check sysctl settings
     local ip_forward=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "sysctl -n net.ipv4.ip_forward" 2>/dev/null || echo "0")
     if [ "$ip_forward" != "1" ]; then
-        print_msg "$YELLOW" "  ⚠ WARN: IP forwarding not enabled (net.ipv4.ip_forward=$ip_forward)"
+        print_msg "$RED" "  ✗ FAIL: IP forwarding not enabled"
+        print_msg "$YELLOW" "    Fix: Add to /etc/sysctl.d/k8s.conf: net.ipv4.ip_forward = 1"
+        node_passed=false
+        VALIDATION_PASSED=false
     else
         print_msg "$GREEN" "  ✓ PASS: IP forwarding enabled"
+    fi
+    
+    # Check time synchronization
+    local time_sync=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "timedatectl show --property=NTPSynchronized --value" 2>/dev/null)
+    if [ "$time_sync" != "yes" ]; then
+        print_msg "$RED" "  ✗ FAIL: Time not synchronized via NTP"
+        print_msg "$YELLOW" "    Fix: sudo apt install chrony && sudo systemctl enable --now chrony"
+        node_passed=false
+        VALIDATION_PASSED=false
+    else
+        print_msg "$GREEN" "  ✓ PASS: Time synchronized via NTP"
+    fi
+    
+    # Check DNS resolution
+    ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "nslookup google.com >/dev/null 2>&1"
+    if [ $? -ne 0 ]; then
+        print_msg "$RED" "  ✗ FAIL: DNS resolution not working"
+        print_msg "$YELLOW" "    Fix: Check /etc/resolv.conf for valid nameservers"
+        node_passed=false
+        VALIDATION_PASSED=false
+    else
+        print_msg "$GREEN" "  ✓ PASS: DNS resolution working"
+    fi
+    
+    # Check required packages
+    local missing_pkgs=""
+    for pkg in curl wget socat conntrack ipset; do
+        ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "which $pkg >/dev/null 2>&1"
+        if [ $? -ne 0 ]; then
+            missing_pkgs="$missing_pkgs $pkg"
+        fi
+    done
+    
+    if [ -n "$missing_pkgs" ]; then
+        print_msg "$RED" "  ✗ FAIL: Missing packages:$missing_pkgs"
+        print_msg "$YELLOW" "    Fix: sudo apt-get update && sudo apt-get install -y$missing_pkgs"
+        node_passed=false
+        VALIDATION_PASSED=false
+    else
+        print_msg "$GREEN" "  ✓ PASS: Required packages installed"
+    fi
+    
+    # Check AppArmor status
+    local apparmor=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "sudo aa-status 2>/dev/null | grep -c 'profiles are in enforce mode'" || echo "0")
+    if [ "$apparmor" -gt 0 ]; then
+        print_msg "$YELLOW" "  ⚠ WARN: AppArmor has $apparmor enforcing profiles (may cause issues)"
+    fi
+    
+    # Check NetworkManager
+    local nm_status=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "systemctl is-active NetworkManager 2>/dev/null" || echo "inactive")
+    if [ "$nm_status" = "active" ]; then
+        print_msg "$YELLOW" "  ⚠ WARN: NetworkManager is active (may interfere with CNI)"
+        print_msg "$YELLOW" "    Consider: sudo systemctl disable --now NetworkManager"
     fi
     
     # Check firewall
     local ufw_status=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "sudo ufw status 2>/dev/null | grep -c 'Status: active'" || echo "0")
     if [ "$ufw_status" -gt 0 ]; then
         print_msg "$YELLOW" "  ⚠ WARN: UFW firewall is active (may block cluster communication)"
+        print_msg "$YELLOW" "    Fix: sudo ufw disable"
     else
         print_msg "$GREEN" "  ✓ PASS: UFW firewall inactive"
     fi
@@ -122,7 +194,15 @@ check_node_prereqs() {
         node_passed=false
         VALIDATION_PASSED=false
     else
-        print_msg "$GREEN" "  ✓ PASS: Disk space: ${disk_space}GB available"
+        print_msg "$GREEN" "  ✓ PASS: Root disk space: ${disk_space}GB available"
+    fi
+    
+    # Check /var space
+    local var_space=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "df -BG /var | awk 'NR==2 {print \$4}' | sed 's/G//'" 2>/dev/null || echo "0")
+    if [ "$var_space" -lt 30 ]; then
+        print_msg "$YELLOW" "  ⚠ WARN: Low /var space: ${var_space}GB (30GB+ recommended for container storage)"
+    else
+        print_msg "$GREEN" "  ✓ PASS: /var space: ${var_space}GB available"
     fi
     
     # Check memory
@@ -154,16 +234,27 @@ check_node_prereqs() {
     local kubectl_exists=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "which kubectl 2>/dev/null" || echo "")
     if [ -n "$kubectl_exists" ]; then
         print_msg "$YELLOW" "  ⚠ WARN: Existing kubectl found at $kubectl_exists"
+        print_msg "$YELLOW" "    Consider removing old Kubernetes packages"
     fi
     
-    # Check hostname uniqueness
+    # Check hostname and resolution
     local hostname=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "hostname" 2>/dev/null || echo "unknown")
-    print_msg "$BLUE" "  ℹ Hostname: $hostname"
+    local resolved_ip=$(ssh -o StrictHostKeyChecking=no -i "$key" "$user@$ip" "getent hosts $hostname | awk '{print \$1}'" 2>/dev/null)
+    
+    if [ -z "$resolved_ip" ]; then
+        print_msg "$YELLOW" "  ⚠ WARN: Hostname $hostname does not resolve locally"
+        print_msg "$YELLOW" "    Fix: Add '127.0.1.1 $hostname' to /etc/hosts"
+    else
+        print_msg "$BLUE" "  ℹ Hostname: $hostname (resolves to $resolved_ip)"
+    fi
+    
+    # Store hostname for uniqueness check
+    HOSTNAMES+=("$hostname")
     
     return $([ "$node_passed" = true ])
 }
 
-# Function to check network connectivity between nodes
+# Function to check node connectivity
 check_node_connectivity() {
     local from_ip=$1
     local to_ip=$2
@@ -188,6 +279,7 @@ echo "==================================================================" >> "$V
 
 print_msg "$BLUE" "╔══════════════════════════════════════════════════════════╗"
 print_msg "$BLUE" "║      NKP Bare Metal Infrastructure Validation           ║"
+print_msg "$BLUE" "║                    (Read-Only)                          ║"
 print_msg "$BLUE" "╚══════════════════════════════════════════════════════════╝"
 echo
 
@@ -311,6 +403,18 @@ for ip in "${WORKER_IPS[@]}"; do
     check_node_prereqs "$ip" "$SSH_USER" "$SSH_KEY" "Worker"
 done
 
+# Check hostname uniqueness
+print_msg "$BLUE" "\n>>> Hostname Uniqueness Check"
+print_msg "$BLUE" "----------------------------------------"
+unique_hostnames=($(printf "%s\n" "${HOSTNAMES[@]}" | sort -u))
+if [ ${#unique_hostnames[@]} -ne ${#HOSTNAMES[@]} ]; then
+    print_msg "$RED" "  ✗ FAIL: Duplicate hostnames detected"
+    print_msg "$YELLOW" "  All hostnames must be unique across the cluster"
+    VALIDATION_PASSED=false
+else
+    print_msg "$GREEN" "  ✓ PASS: All hostnames are unique"
+fi
+
 # Check VIP interface consistency for HA
 if [ "$CP_COUNT" -eq 3 ]; then
     print_msg "$BLUE" "\n>>> HA Configuration Validation"
@@ -377,102 +481,66 @@ else
     print_msg "$YELLOW" "\n  Fix: Check network configuration and firewall rules"
 fi
 
-# Generate remediation script if issues found
-if [ "$VALIDATION_PASSED" = false ]; then
-    cat > "fix-prerequisites.sh" << 'FIX_SCRIPT'
-#!/bin/bash
-# Auto-generated script to fix common prerequisites
+# Test external registry connectivity
+print_msg "$BLUE" "\n>>> External Registry Connectivity Test"
+print_msg "$BLUE" "----------------------------------------"
 
-NODES="$@"
-if [ -z "$NODES" ]; then
-    echo "Usage: $0 <node-ip> [node-ip...]"
-    exit 1
-fi
+# Define Helm repositories (subset for brevity)
+HELM_REPOS=(
+    "charts.bitnami.com"
+    "prometheus-community.github.io"
+    "grafana.github.io"
+    "mesosphere.github.io"
+)
 
-SSH_USER="nutanix"  # Update this as needed
-SSH_KEY="~/.ssh/id_rsa"  # Update this as needed
+# Define container registries
+CONTAINER_REGISTRIES=(
+    "docker.io"
+    "gcr.io"
+    "registry.k8s.io"
+    "quay.io"
+    "ghcr.io"
+)
 
-for NODE in $NODES; do
-    echo "========================================="
-    echo "Fixing prerequisites on $NODE..."
-    echo "========================================="
+# Function to test HTTPS connectivity
+test_https_connectivity() {
+    local node_ip=$1
+    local target=$2
+    local timeout=5
     
-    ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$NODE" << 'EOF'
-# Create user if not exists and setup sudo
-if ! id nutanix >/dev/null 2>&1; then
-    sudo useradd -m -s /bin/bash nutanix
-fi
-echo "nutanix ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/nutanix
+    # Test using curl with timeout
+    ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$node_ip" \
+        "curl -k --connect-timeout $timeout -s -o /dev/null -w '%{http_code}' https://$target 2>/dev/null | grep -qE '^[23][0-9]{2}$'" 2>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        return 0
+    fi
+    
+    # Fallback to nc test for port 443
+    ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$SSH_USER@$node_ip" \
+        "timeout $timeout nc -zv $target 443 &>/dev/null" 2>/dev/null
+    
+    return $?
+}
 
-# Disable swap
-sudo swapoff -a
-sudo sed -i '/ swap / s/^/#/' /etc/fstab
+registry_issues=false
 
-# Load kernel modules
-sudo modprobe overlay
-sudo modprobe br_netfilter
-cat <<EOL | sudo tee /etc/modules-load.d/k8s.conf
-overlay
-br_netfilter
-EOL
+print_msg "$BLUE" "  Testing registry connectivity from first node..."
+test_node="${CONTROL_PLANE_IPS[0]}"
 
-# Configure sysctl
-cat <<EOL | sudo tee /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward = 1
-EOL
-sudo sysctl --system
-
-# Disable firewall
-sudo ufw disable 2>/dev/null || true
-
-# Remove old Kubernetes packages
-sudo apt-get remove -y kubelet kubeadm kubectl kubernetes-cni 2>/dev/null || true
-sudo rm -f /etc/apt/sources.list.d/kubernetes*.list
-
-# Update and install required packages
-sudo apt-get update
-sudo apt-get install -y \
-    curl \
-    wget \
-    socat \
-    conntrack \
-    ipset \
-    net-tools \
-    dnsutils \
-    chrony \
-    htop \
-    iotop \
-    sysstat
-
-# Enable time synchronization
-sudo systemctl enable --now chrony
-
-# Fix hostname resolution
-HOSTNAME=$(hostname)
-if ! grep -q "$HOSTNAME" /etc/hosts; then
-    echo "127.0.1.1 $HOSTNAME" | sudo tee -a /etc/hosts
-fi
-
-# Create storage directories (for worker nodes)
-sudo mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5}
-sudo chmod 777 /mnt/local-storage/*
-sudo mkdir -p /mnt/prometheus
-sudo chmod 777 /mnt/prometheus
-
-echo "Prerequisites fixed on $(hostname)"
-echo "Please verify time sync: timedatectl status"
-echo "Please verify DNS: nslookup google.com"
-EOF
+for registry in "${CONTAINER_REGISTRIES[@]}"; do
+    if test_https_connectivity "$test_node" "$registry"; then
+        print_msg "$GREEN" "  ✓ $registry: reachable"
+    else
+        print_msg "$RED" "  ✗ $registry: unreachable"
+        registry_issues=true
+        VALIDATION_PASSED=false
+    fi
 done
 
-echo "========================================="
-echo "Prerequisites script completed!"
-echo "IMPORTANT: Reboot all nodes to ensure all changes take effect"
-echo "Run: sudo reboot"
-FIX_SCRIPT
-    chmod +x fix-prerequisites.sh
+if [ "$registry_issues" = true ]; then
+    print_msg "$YELLOW" "\n  Fix: Check outbound HTTPS (port 443) connectivity and firewall rules"
+    print_msg "$YELLOW" "  Ensure all nodes can reach required Helm and container registries"
 fi
 
 # Final summary
@@ -488,10 +556,10 @@ if [ "$VALIDATION_PASSED" = true ]; then
 else
     print_msg "$RED" "✗ Infrastructure validation FAILED"
     print_msg "$YELLOW" "\nIssues were found that must be resolved before deployment."
-    print_msg "$YELLOW" "Review the validation report: $VALIDATION_REPORT"
-    print_msg "$YELLOW" "\nTo fix common issues, run:"
-    print_msg "$YELLOW" "  ./fix-prerequisites.sh ${CONTROL_PLANE_IPS[@]} ${WORKER_IPS[@]}"
+    print_msg "$YELLOW" "Review the detailed report above for specific fixes."
 fi
 
 echo
 print_msg "$BLUE" "Full validation report saved to: $VALIDATION_REPORT"
+echo
+print_msg "$YELLOW" "Note: This is a read-only validation. No changes were made to any systems."
