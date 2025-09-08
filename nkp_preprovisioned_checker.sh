@@ -293,43 +293,56 @@ set -e
 DEPLOY_USER="'$DEPLOY_USER'"
 NODE_TYPE="'$node_type'"
 
-# 1. Create deployment user
+echo "Starting fixes on $(hostname)..."
+
+# 1. Create deployment user if needed
 if ! id "$DEPLOY_USER" &>/dev/null; then
     echo "Creating user $DEPLOY_USER..."
     sudo useradd -m -s /bin/bash "$DEPLOY_USER" || true
     echo "$DEPLOY_USER:changeme123" | sudo chpasswd
 fi
 
-# 2. Configure sudo
+# 2. Configure sudo for deployment user
 echo "Configuring sudo for $DEPLOY_USER..."
 echo "$DEPLOY_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$DEPLOY_USER
+sudo usermod -aG sudo "$DEPLOY_USER" 2>/dev/null || true
 
-# 3. Load kernel modules
-echo "Loading kernel modules..."
-sudo modprobe overlay
-sudo modprobe br_netfilter
-cat <<EOF | sudo tee /etc/modules-load.d/kubernetes.conf
-overlay
-br_netfilter
-EOF
-
-# 4. Configure sysctl
-echo "Configuring sysctl..."
-cat <<EOF | sudo tee /etc/sysctl.d/kubernetes.conf
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward = 1
-EOF
-sudo sysctl --system
-
-# 5. Disable swap
+# 3. Disable swap
 echo "Disabling swap..."
 sudo swapoff -a
 sudo sed -i "/ swap / s/^/#/" /etc/fstab
 
-# 6. Worker storage directories
+# 4. Load kernel modules
+echo "Loading kernel modules..."
+sudo modprobe overlay
+sudo modprobe br_netfilter
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+# 5. Configure sysctl for Kubernetes
+echo "Configuring sysctl..."
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOF
+sudo sysctl --system >/dev/null 2>&1
+
+# 6. Disable UFW firewall
+echo "Disabling UFW firewall..."
+sudo ufw disable 2>/dev/null || true
+
+# 7. Clean up existing Kubernetes packages
+echo "Cleaning Kubernetes packages..."
+sudo apt-get remove -y kubelet kubeadm kubectl kubernetes-cni 2>/dev/null || true
+sudo rm -f /etc/apt/sources.list.d/kubernetes*.list
+sudo apt-get update >/dev/null 2>&1 || true
+
+# 8. Worker-specific: storage directories
 if [[ "$NODE_TYPE" == "worker" ]]; then
-    echo "Creating storage directories..."
+    echo "Creating storage directories for worker..."
     sudo mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5}
     sudo chmod 777 /mnt/local-storage/*
     sudo mkdir -p /mnt/prometheus
@@ -343,7 +356,7 @@ echo "Fixes applied successfully!"
     if run_remote "$node" "$fix_script"; then
         log_success "Fixes applied to $node"
     else
-        log_error "Failed to apply fixes to $node"
+        log_error "Failed to apply some fixes to $node"
     fi
 }
 
