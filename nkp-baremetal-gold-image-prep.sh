@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Ubuntu 22.04 NKP Prerequisites Setup and Validation Script
+# Ubuntu 22.04 NKP Prerequisites Validation Script - Read Only
 # Version: 1.0
-# Purpose: Prepare and validate Ubuntu 22.04 for NKP deployment
+# Purpose: Validate Ubuntu 22.04 readiness for NKP deployment
 
 set -e
 
@@ -21,7 +21,6 @@ fi
 
 # Validation results
 VALIDATION_PASSED=true
-FIXES_APPLIED=false
 REPORT_FILE="/tmp/nkp-prereq-report-$(date +%Y%m%d-%H%M%S).txt"
 
 # Function to print colored output
@@ -32,12 +31,12 @@ print_msg() {
     echo "$msg" >> "$REPORT_FILE"
 }
 
-# Function to check and fix an issue
-check_and_fix() {
+# Function to check a prerequisite
+check_prereq() {
     local check_name=$1
     local check_cmd=$2
-    local fix_cmd=$3
-    local description=$4
+    local description=$3
+    local fix_instruction=$4
     
     print_msg "$BLUE" "\nChecking: $description"
     
@@ -45,51 +44,26 @@ check_and_fix() {
         print_msg "$GREEN" "  ✓ PASS: $description"
         return 0
     else
-        print_msg "$YELLOW" "  ✗ FAIL: $description"
-        
-        if [ "$FIX_MODE" = true ]; then
-            print_msg "$YELLOW" "  → Applying fix..."
-            if eval "$fix_cmd"; then
-                # Re-check after fix
-                if eval "$check_cmd"; then
-                    print_msg "$GREEN" "  ✓ FIXED: $description"
-                    FIXES_APPLIED=true
-                else
-                    print_msg "$RED" "  ✗ Fix failed for: $description"
-                    VALIDATION_PASSED=false
-                fi
-            else
-                print_msg "$RED" "  ✗ Could not apply fix for: $description"
-                VALIDATION_PASSED=false
-            fi
-        else
-            VALIDATION_PASSED=false
+        print_msg "$RED" "  ✗ FAIL: $description"
+        if [ -n "$fix_instruction" ]; then
+            print_msg "$YELLOW" "  Fix: $fix_instruction"
         fi
+        VALIDATION_PASSED=false
+        return 1
     fi
 }
 
 # Header
 clear
 echo "==================================================================" > "$REPORT_FILE"
-echo "Ubuntu 22.04 NKP Prerequisites Report" >> "$REPORT_FILE"
+echo "Ubuntu 22.04 NKP Prerequisites Validation Report" >> "$REPORT_FILE"
 echo "Generated: $(date)" >> "$REPORT_FILE"
 echo "Hostname: $(hostname)" >> "$REPORT_FILE"
 echo "==================================================================" >> "$REPORT_FILE"
 
 print_msg "$BLUE" "╔══════════════════════════════════════════════════════════╗"
-print_msg "$BLUE" "║    Ubuntu 22.04 NKP Prerequisites Setup & Validation    ║"
+print_msg "$BLUE" "║   Ubuntu 22.04 NKP Prerequisites Validation (Read-Only)  ║"
 print_msg "$BLUE" "╚══════════════════════════════════════════════════════════╝"
-echo
-
-# Check if running in fix mode
-if [ "$1" == "--fix" ] || [ "$1" == "-f" ]; then
-    FIX_MODE=true
-    print_msg "$YELLOW" "Running in FIX mode - will attempt to fix issues automatically"
-else
-    FIX_MODE=false
-    print_msg "$BLUE" "Running in CHECK mode - will only report issues"
-    print_msg "$BLUE" "To auto-fix issues, run: $0 --fix"
-fi
 echo
 
 # System Information
@@ -100,152 +74,181 @@ print_msg "$BLUE" "  Architecture: $(uname -m)"
 print_msg "$BLUE" "  Hostname: $(hostname)"
 print_msg "$BLUE" "  CPU Cores: $(nproc)"
 print_msg "$BLUE" "  Memory: $(free -h | awk '/^Mem:/ {print $2}')"
-print_msg "$BLUE" "  Disk: $(df -h / | awk 'NR==2 {print $4}') available"
+print_msg "$BLUE" "  Disk: $(df -h / | awk 'NR==2 {print $4}') available on /"
+print_msg "$BLUE" "  /var: $(df -h /var | awk 'NR==2 {print $4}') available"
 
 # Prerequisites Checks
 print_msg "$GREEN" "\n=== Prerequisites Validation ==="
 
 # 1. Check Ubuntu version
-check_and_fix "ubuntu_version" \
+check_prereq "ubuntu_version" \
     "[[ $(lsb_release -rs) == '22.04' ]]" \
-    "echo 'Cannot auto-fix OS version - manual reinstall required'" \
-    "Ubuntu 22.04 LTS"
+    "Ubuntu 22.04 LTS" \
+    "Install Ubuntu 22.04 LTS"
 
-# 2. Check and create NKP user with sudo
-check_and_fix "nkp_user" \
+# 2. Check NKP user with sudo
+check_prereq "nkp_user" \
     "id nutanix >/dev/null 2>&1 && sudo -u nutanix -n true 2>/dev/null" \
-    "useradd -m -s /bin/bash nutanix 2>/dev/null || true; echo 'nutanix ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/nutanix" \
-    "NKP user (nutanix) with passwordless sudo"
+    "User 'nutanix' exists with passwordless sudo" \
+    "useradd -m -s /bin/bash nutanix && echo 'nutanix ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/nutanix"
 
-# 3. Check and disable swap
-check_and_fix "swap" \
+# 3. Check swap
+check_prereq "swap" \
     "[[ $(swapon -s | wc -l) -eq 0 ]]" \
-    "swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab" \
-    "Swap disabled"
+    "Swap is disabled" \
+    "swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab"
 
-# 4. Check and load kernel modules
-check_and_fix "overlay_module" \
+# 4. Check kernel modules
+check_prereq "overlay_module" \
     "lsmod | grep -q overlay" \
-    "modprobe overlay && echo 'overlay' >> /etc/modules-load.d/k8s.conf" \
-    "Overlay kernel module"
+    "Overlay kernel module loaded" \
+    "modprobe overlay && echo 'overlay' >> /etc/modules-load.d/k8s.conf"
 
-check_and_fix "br_netfilter_module" \
+check_prereq "br_netfilter_module" \
     "lsmod | grep -q br_netfilter" \
-    "modprobe br_netfilter && echo 'br_netfilter' >> /etc/modules-load.d/k8s.conf" \
-    "br_netfilter kernel module"
+    "br_netfilter kernel module loaded" \
+    "modprobe br_netfilter && echo 'br_netfilter' >> /etc/modules-load.d/k8s.conf"
 
-# 5. Check and configure sysctl settings
-check_and_fix "ip_forward" \
+# 5. Check sysctl settings
+check_prereq "ip_forward" \
     "[[ $(sysctl -n net.ipv4.ip_forward) == '1' ]]" \
-    "echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/k8s.conf && sysctl -p /etc/sysctl.d/k8s.conf" \
-    "IPv4 forwarding enabled"
+    "IPv4 forwarding enabled" \
+    "Add 'net.ipv4.ip_forward = 1' to /etc/sysctl.d/k8s.conf && sysctl -p"
 
-check_and_fix "bridge_nf_call_iptables" \
+check_prereq "bridge_nf_call_iptables" \
     "[[ $(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null) == '1' ]]" \
-    "echo 'net.bridge.bridge-nf-call-iptables = 1' >> /etc/sysctl.d/k8s.conf && sysctl -p /etc/sysctl.d/k8s.conf" \
-    "Bridge netfilter for iptables"
+    "Bridge netfilter for iptables" \
+    "Add 'net.bridge.bridge-nf-call-iptables = 1' to /etc/sysctl.d/k8s.conf"
 
-check_and_fix "bridge_nf_call_ip6tables" \
+check_prereq "bridge_nf_call_ip6tables" \
     "[[ $(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null) == '1' ]]" \
-    "echo 'net.bridge.bridge-nf-call-ip6tables = 1' >> /etc/sysctl.d/k8s.conf && sysctl -p /etc/sysctl.d/k8s.conf" \
-    "Bridge netfilter for ip6tables"
+    "Bridge netfilter for ip6tables" \
+    "Add 'net.bridge.bridge-nf-call-ip6tables = 1' to /etc/sysctl.d/k8s.conf"
 
-# 6. Check and disable firewall
-check_and_fix "ufw_disabled" \
+# 6. Check firewall
+check_prereq "ufw_disabled" \
     "! ufw status 2>/dev/null | grep -q 'Status: active'" \
-    "ufw disable" \
-    "UFW firewall disabled"
+    "UFW firewall is disabled" \
+    "ufw disable"
 
 # 7. Check time synchronization
-check_and_fix "time_sync" \
+check_prereq "time_sync" \
     "[[ $(timedatectl show --property=NTPSynchronized --value) == 'yes' ]]" \
-    "apt-get install -y chrony >/dev/null 2>&1 && systemctl enable --now chrony" \
-    "NTP time synchronization"
+    "NTP time synchronization enabled" \
+    "apt-get install -y chrony && systemctl enable --now chrony"
 
 # 8. Check DNS resolution
-check_and_fix "dns_resolution" \
+check_prereq "dns_resolution" \
     "nslookup google.com >/dev/null 2>&1" \
-    "echo 'nameserver 8.8.8.8' >> /etc/resolv.conf" \
-    "DNS resolution"
+    "DNS resolution working" \
+    "Check /etc/resolv.conf for valid nameservers"
 
 # 9. Check hostname resolution
-check_and_fix "hostname_resolution" \
+check_prereq "hostname_resolution" \
     "getent hosts $(hostname) >/dev/null 2>&1" \
-    "echo '127.0.1.1 $(hostname)' >> /etc/hosts" \
-    "Hostname resolution in /etc/hosts"
+    "Hostname resolves locally" \
+    "Add '127.0.1.1 $(hostname)' to /etc/hosts"
 
 # 10. Check required packages
 REQUIRED_PACKAGES="curl wget socat conntrack ipset net-tools dnsutils chrony"
-check_and_fix "required_packages" \
-    "which curl wget socat conntrack ipset >/dev/null 2>&1" \
-    "apt-get update >/dev/null 2>&1 && apt-get install -y $REQUIRED_PACKAGES >/dev/null 2>&1" \
-    "Required system packages"
+missing_packages=""
+for pkg in $REQUIRED_PACKAGES; do
+    if ! which $pkg >/dev/null 2>&1; then
+        missing_packages="$missing_packages $pkg"
+    fi
+done
+
+if [ -z "$missing_packages" ]; then
+    print_msg "$GREEN" "\n  ✓ PASS: All required packages installed"
+else
+    print_msg "$RED" "\n  ✗ FAIL: Missing packages:$missing_packages"
+    print_msg "$YELLOW" "  Fix: apt-get update && apt-get install -y$missing_packages"
+    VALIDATION_PASSED=false
+fi
 
 # 11. Check for conflicting Kubernetes packages
-check_and_fix "no_existing_k8s" \
-    "! (dpkg -l | grep -qE 'kubelet|kubeadm|kubectl|kubernetes-cni')" \
-    "apt-get remove -y kubelet kubeadm kubectl kubernetes-cni 2>/dev/null; rm -f /etc/apt/sources.list.d/kubernetes*.list" \
-    "No conflicting Kubernetes packages"
+if dpkg -l | grep -qE 'kubelet|kubeadm|kubectl|kubernetes-cni'; then
+    print_msg "$RED" "\n  ✗ FAIL: Existing Kubernetes packages found"
+    print_msg "$YELLOW" "  Fix: apt-get remove -y kubelet kubeadm kubectl kubernetes-cni"
+    VALIDATION_PASSED=false
+else
+    print_msg "$GREEN" "\n  ✓ PASS: No conflicting Kubernetes packages"
+fi
 
-# 12. Check AppArmor (warning only)
+# 12. Check AppArmor
 apparmor_profiles=$(aa-status 2>/dev/null | grep -c 'profiles are in enforce mode' || echo "0")
 if [ "$apparmor_profiles" -gt 0 ]; then
-    print_msg "$YELLOW" "\n⚠ WARNING: AppArmor has $apparmor_profiles enforcing profiles"
+    print_msg "$YELLOW" "\n  ⚠ WARNING: AppArmor has $apparmor_profiles enforcing profiles"
     print_msg "$YELLOW" "  This may cause issues with container operations"
 fi
 
-# 13. Check NetworkManager (warning only)
+# 13. Check NetworkManager
 if systemctl is-active NetworkManager >/dev/null 2>&1; then
-    print_msg "$YELLOW" "\n⚠ WARNING: NetworkManager is active"
+    print_msg "$YELLOW" "\n  ⚠ WARNING: NetworkManager is active"
     print_msg "$YELLOW" "  This may interfere with CNI networking"
-    if [ "$FIX_MODE" = true ]; then
-        print_msg "$YELLOW" "  → Disabling NetworkManager..."
-        systemctl disable --now NetworkManager 2>/dev/null
-    fi
+    print_msg "$YELLOW" "  Consider: systemctl disable --now NetworkManager"
 fi
 
-# 14. Check disk space (minimum 50GB free on root)
-check_and_fix "disk_space" \
-    "[[ $(df -BG / | awk 'NR==2 {print int($4)}') -ge 50 ]]" \
-    "echo 'Cannot auto-fix disk space - manual cleanup required'" \
-    "Minimum 50GB free disk space on /"
+# 14. Check disk space
+root_space=$(df -BG / | awk 'NR==2 {print int($4)}')
+if [ "$root_space" -ge 50 ]; then
+    print_msg "$GREEN" "\n  ✓ PASS: Root filesystem has ${root_space}GB free (minimum 50GB)"
+else
+    print_msg "$RED" "\n  ✗ FAIL: Insufficient disk space on /: ${root_space}GB (minimum 50GB required)"
+    VALIDATION_PASSED=false
+fi
 
-# 15. Check /var space (minimum 30GB)
-check_and_fix "var_space" \
-    "[[ $(df -BG /var | awk 'NR==2 {print int($4)}') -ge 30 ]]" \
-    "echo 'Cannot auto-fix /var space - manual cleanup required'" \
-    "Minimum 30GB free space in /var"
+# 15. Check /var space
+var_space=$(df -BG /var | awk 'NR==2 {print int($4)}')
+if [ "$var_space" -ge 30 ]; then
+    print_msg "$GREEN" "  ✓ PASS: /var has ${var_space}GB free (minimum 30GB)"
+else
+    print_msg "$YELLOW" "  ⚠ WARNING: Low space in /var: ${var_space}GB (30GB+ recommended)"
+fi
 
-# 16. Check memory (minimum 8GB)
-check_and_fix "memory" \
-    "[[ $(free -g | awk '/^Mem:/ {print int($2)}') -ge 8 ]]" \
-    "echo 'Cannot auto-fix memory - hardware upgrade required'" \
-    "Minimum 8GB RAM"
+# 16. Check memory
+mem_gb=$(free -g | awk '/^Mem:/ {print int($2)}')
+if [ "$mem_gb" -ge 8 ]; then
+    print_msg "$GREEN" "  ✓ PASS: System has ${mem_gb}GB RAM (minimum 8GB)"
+else
+    print_msg "$RED" "  ✗ FAIL: Insufficient memory: ${mem_gb}GB (minimum 8GB required)"
+    VALIDATION_PASSED=false
+fi
 
-# 17. Check CPU cores (minimum 4)
-check_and_fix "cpu_cores" \
-    "[[ $(nproc) -ge 4 ]]" \
-    "echo 'Cannot auto-fix CPU cores - hardware upgrade required'" \
-    "Minimum 4 CPU cores"
+# 17. Check CPU cores
+cpu_cores=$(nproc)
+if [ "$cpu_cores" -ge 4 ]; then
+    print_msg "$GREEN" "  ✓ PASS: System has ${cpu_cores} CPU cores (minimum 4)"
+else
+    print_msg "$RED" "  ✗ FAIL: Insufficient CPU cores: ${cpu_cores} (minimum 4 required)"
+    VALIDATION_PASSED=false
+fi
 
 # 18. Check overlay filesystem support
-check_and_fix "overlay_fs" \
-    "grep -q overlay /proc/filesystems" \
-    "echo 'Overlay filesystem not supported - kernel upgrade may be required'" \
-    "Overlay filesystem support"
+if grep -q overlay /proc/filesystems; then
+    print_msg "$GREEN" "  ✓ PASS: Overlay filesystem is supported"
+else
+    print_msg "$RED" "  ✗ FAIL: Overlay filesystem not supported"
+    print_msg "$YELLOW" "  Fix: Kernel upgrade may be required"
+    VALIDATION_PASSED=false
+fi
 
-# 19. Create required directories for local storage
-check_and_fix "storage_dirs" \
-    "[[ -d /mnt/local-storage/pv1 ]]" \
-    "mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5} && chmod 777 /mnt/local-storage/*" \
-    "Local storage directories"
+# 19. Check storage directories
+if [ -d /mnt/local-storage/pv1 ]; then
+    print_msg "$GREEN" "  ✓ PASS: Local storage directories exist"
+else
+    print_msg "$YELLOW" "  ⚠ INFO: Local storage directories not created"
+    print_msg "$YELLOW" "  Fix: mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5} && chmod 777 /mnt/local-storage/*"
+fi
 
-check_and_fix "prometheus_dir" \
-    "[[ -d /mnt/prometheus ]]" \
-    "mkdir -p /mnt/prometheus && chmod 777 /mnt/prometheus" \
-    "Prometheus storage directory"
+if [ -d /mnt/prometheus ]; then
+    print_msg "$GREEN" "  ✓ PASS: Prometheus storage directory exists"
+else
+    print_msg "$YELLOW" "  ⚠ INFO: Prometheus storage directory not created"
+    print_msg "$YELLOW" "  Fix: mkdir -p /mnt/prometheus && chmod 777 /mnt/prometheus"
+fi
 
-# 11. Check network connectivity to required registries
+# 20. Network connectivity tests
 print_msg "$GREEN" "\n=== External Connectivity Validation ==="
 
 # Container registries to check
@@ -269,45 +272,8 @@ for registry in "${REGISTRIES[@]}"; do
     fi
 done
 
-# Helm repositories to check (subset of most critical)
-HELM_REPOS=(
-    "charts.bitnami.com"
-    "prometheus-community.github.io"
-    "grafana.github.io"
-    "mesosphere.github.io"
-)
-
-print_msg "$BLUE" "\nChecking Helm repository connectivity..."
-for repo in "${HELM_REPOS[@]}"; do
-    if curl -k --connect-timeout 5 -s -o /dev/null -w "%{http_code}" "https://$repo" 2>/dev/null | grep -qE '^[23][0-9]{2}$'; then
-        print_msg "$GREEN" "  ✓ $repo: reachable"
-    else
-        print_msg "$RED" "  ✗ $repo: unreachable"
-        VALIDATION_PASSED=false
-    fi
-done
-
-# System packages update
-if [ "$FIX_MODE" = true ]; then
-    print_msg "$GREEN" "\n=== System Updates ==="
-    print_msg "$BLUE" "Updating system packages..."
-    
-    apt-get update >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        print_msg "$GREEN" "  ✓ Package list updated"
-    else
-        print_msg "$RED" "  ✗ Failed to update package list"
-    fi
-    
-    # Install useful packages
-    print_msg "$BLUE" "Installing required packages..."
-    PACKAGES="curl wget git vim net-tools htop iotop sysstat"
-    apt-get install -y $PACKAGES >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        print_msg "$GREEN" "  ✓ Required packages installed"
-    else
-        print_msg "$YELLOW" "  ⚠ Some packages may have failed to install"
-    fi
+if [ "$registry_failed" = true ]; then
+    print_msg "$YELLOW" "\n  Check your internet connectivity and firewall rules"
 fi
 
 # Final Summary
@@ -318,29 +284,18 @@ print_msg "$BLUE" "╚═══════════════════�
 echo
 
 if [ "$VALIDATION_PASSED" = true ]; then
-    if [ "$FIXES_APPLIED" = true ]; then
-        print_msg "$GREEN" "✓ All prerequisites met after applying fixes"
-        print_msg "$YELLOW" "⚠ IMPORTANT: Reboot recommended to ensure all changes take effect"
-        print_msg "$YELLOW" "  Run: sudo reboot"
-    else
-        print_msg "$GREEN" "✓ All prerequisites already met - system is ready for NKP"
-    fi
+    print_msg "$GREEN" "✓ All prerequisites are met - system is ready for NKP"
 else
     print_msg "$RED" "✗ Some prerequisites are not met"
-    
-    if [ "$FIX_MODE" = false ]; then
-        print_msg "$YELLOW" "\nTo attempt automatic fixes, run:"
-        print_msg "$YELLOW" "  sudo $0 --fix"
-    else
-        print_msg "$YELLOW" "\nSome issues could not be automatically fixed."
-        print_msg "$YELLOW" "Review the report and address issues manually."
-    fi
+    print_msg "$YELLOW" "\nReview the report above for specific issues and fixes."
+    print_msg "$YELLOW" "Each failed item includes instructions on how to fix it."
 fi
 
 echo
 print_msg "$BLUE" "Report saved to: $REPORT_FILE"
+print_msg "$YELLOW" "\nNote: This is a read-only validation. No changes were made to the system."
 
-# Create a summary file for automation
+# Create a status file for automation
 if [ "$VALIDATION_PASSED" = true ]; then
     echo "READY" > /tmp/nkp-ready-status
 else
