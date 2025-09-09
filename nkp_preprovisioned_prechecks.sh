@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# NKP Pre-requisite Checker
+# NKP Pre-requisite Checker - Updated with storage mount requirements
 
 set -u
 
@@ -50,21 +50,21 @@ echo ""
 check_node() {
     local node=$1
     local node_type=$2
-    
+
     # Trim whitespace from node IP
     node=$(echo "$node" | xargs)
-    
+
     echo "========================================="
     echo "$node_type: $node"
     echo "========================================="
-    
+
     ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$SSH_USER@$node" "
         DEPLOY_USER='$DEPLOY_USER'
         NODE_TYPE='$node_type'
-        
+
         echo '1. User Configuration:'
         echo -n '   User '\$DEPLOY_USER' exists: '
-        if id \$DEPLOY_USER &>/dev/null; then 
+        if id \$DEPLOY_USER &>/dev/null; then
             echo -e '\033[0;32m[PASS]\033[0m'
             echo -n '   In sudo group: '
             if groups \$DEPLOY_USER | grep -q sudo; then
@@ -78,16 +78,16 @@ check_node() {
             else
                 echo -e '\033[0;31m[FAIL]\033[0m'
             fi
-        else 
+        else
             echo -e '\033[0;31m[FAIL] User not found\033[0m'
         fi
-        
+
         echo ''
         echo '2. Swap Status:'
         echo -n '   Swap disabled: '
-        if swapon -s 2>/dev/null | grep -q '^/'; then 
+        if swapon -s 2>/dev/null | grep -q '^/'; then
             echo -e '\033[0;31m[FAIL] Swap is active\033[0m'
-        else 
+        else
             echo -e '\033[0;32m[PASS]\033[0m'
         fi
         echo -n '   Swap in /etc/fstab: '
@@ -96,19 +96,19 @@ check_node() {
         else
             echo -e '\033[0;32m[PASS] Disabled\033[0m'
         fi
-        
+
         echo ''
         echo '3. Kernel Modules:'
         echo -n '   overlay loaded: '
-        if lsmod | grep -q overlay; then 
+        if lsmod | grep -q overlay; then
             echo -e '\033[0;32m[PASS]\033[0m'
-        else 
+        else
             echo -e '\033[0;31m[FAIL]\033[0m'
         fi
         echo -n '   br_netfilter loaded: '
-        if lsmod | grep -q br_netfilter; then 
+        if lsmod | grep -q br_netfilter; then
             echo -e '\033[0;32m[PASS]\033[0m'
-        else 
+        else
             echo -e '\033[0;31m[FAIL]\033[0m'
         fi
         echo -n '   Persistent config: '
@@ -117,25 +117,25 @@ check_node() {
         else
             echo -e '\033[0;31m[FAIL]\033[0m'
         fi
-        
+
         echo ''
         echo '4. Sysctl Settings:'
         echo -n '   bridge-nf-call-iptables = 1: '
-        if [ \"\$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)\" = \"1\" ]; then 
+        if [ \"\$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null)\" = \"1\" ]; then
             echo -e '\033[0;32m[PASS]\033[0m'
-        else 
+        else
             echo -e '\033[0;31m[FAIL]\033[0m'
         fi
         echo -n '   bridge-nf-call-ip6tables = 1: '
-        if [ \"\$(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null)\" = \"1\" ]; then 
+        if [ \"\$(sysctl -n net.bridge.bridge-nf-call-ip6tables 2>/dev/null)\" = \"1\" ]; then
             echo -e '\033[0;32m[PASS]\033[0m'
-        else 
+        else
             echo -e '\033[0;31m[FAIL]\033[0m'
         fi
         echo -n '   ip_forward = 1: '
-        if [ \"\$(sysctl -n net.ipv4.ip_forward 2>/dev/null)\" = \"1\" ]; then 
+        if [ \"\$(sysctl -n net.ipv4.ip_forward 2>/dev/null)\" = \"1\" ]; then
             echo -e '\033[0;32m[PASS]\033[0m'
-        else 
+        else
             echo -e '\033[0;31m[FAIL]\033[0m'
         fi
         echo -n '   Persistent config: '
@@ -144,16 +144,16 @@ check_node() {
         else
             echo -e '\033[0;31m[FAIL]\033[0m'
         fi
-        
+
         echo ''
         echo '5. Firewall:'
         echo -n '   UFW status: '
-        if ufw status 2>/dev/null | grep -q 'Status: active'; then 
+        if ufw status 2>/dev/null | grep -q 'Status: active'; then
             echo -e '\033[0;31m[FAIL] Active\033[0m'
-        else 
+        else
             echo -e '\033[0;32m[PASS] Disabled\033[0m'
         fi
-        
+
         echo ''
         echo '6. Kubernetes Packages:'
         echo -n '   kubelet: '
@@ -170,27 +170,51 @@ check_node() {
         else
             echo -e '\033[0;32m[PASS] Clean\033[0m'
         fi
-        
+
         if [ \"\$NODE_TYPE\" = \"worker\" ]; then
             echo ''
-            echo '7. Worker Storage Directories:'
+            echo '7. Worker Storage - Local Volume Provisioner:'
+            echo '   Checking for MOUNTED volumes (required by local-volume-provisioner):'
+            
+            # Check if any volumes are mounted
+            MOUNT_COUNT=\$(mount | grep '/mnt/disks/vol' | wc -l)
+            echo -n \"   Mounted volumes found: \$MOUNT_COUNT \"
+            if [ \$MOUNT_COUNT -ge 4 ]; then
+                echo -e '\033[0;32m[PASS] (minimum 4 required)\033[0m'
+            else
+                echo -e '\033[0;31m[FAIL] (minimum 4 required)\033[0m'
+            fi
+            
+            # Check first 5 mounts specifically
             for i in 1 2 3 4 5; do
-                echo -n \"   /mnt/local-storage/pv\$i: \"
-                if [ -d /mnt/local-storage/pv\$i ] && [ \"\$(stat -c %a /mnt/local-storage/pv\$i)\" = \"777\" ]; then
+                echo -n \"   /mnt/disks/vol\$i mounted: \"
+                if mount | grep -q \"/mnt/disks/vol\$i\"; then
                     echo -e '\033[0;32m[PASS]\033[0m'
                 else
-                    echo -e '\033[0;31m[FAIL]\033[0m'
+                    echo -e '\033[1;33m[WARN] Not mounted\033[0m'
                 fi
             done
-            echo -n '   /mnt/prometheus: '
+            
+            echo ''
+            echo '8. Worker Storage - Helm Repository Support:'
+            echo -n '   /var/tmp/helm-repo directory: '
+            if [ -d /var/tmp/helm-repo ] && [ \"\$(stat -c %a /var/tmp/helm-repo)\" = \"777\" ]; then
+                echo -e '\033[0;32m[PASS]\033[0m'
+            else
+                echo -e '\033[0;31m[FAIL] Missing or wrong permissions\033[0m'
+            fi
+            
+            echo ''
+            echo '9. Worker Storage - Prometheus:'
+            echo -n '   /mnt/prometheus directory: '
             if [ -d /mnt/prometheus ] && [ \"\$(stat -c %a /mnt/prometheus)\" = \"777\" ]; then
                 echo -e '\033[0;32m[PASS]\033[0m'
             else
-                echo -e '\033[0;31m[FAIL]\033[0m'
+                echo -e '\033[0;31m[FAIL] Missing or wrong permissions\033[0m'
             fi
         fi
     " || echo "ERROR: Cannot connect to $node"
-    
+
     echo ""
 }
 
@@ -246,9 +270,27 @@ sudo apt-get remove -y kubelet kubeadm kubectl kubernetes-cni || true
 sudo rm -f /etc/apt/sources.list.d/kubernetes*.list
 sudo apt-get update
 
-# 7. Create storage directories (workers only)
-sudo mkdir -p /mnt/local-storage/{pv1,pv2,pv3,pv4,pv5}
-sudo chmod 777 /mnt/local-storage/*
+# 7. Create MOUNTED storage for local-volume-provisioner (workers only)
+# IMPORTANT: local-volume-provisioner requires actual mount points, not just directories
+
+# Option A: For testing/PoC - Use tmpfs (data lost on reboot)
+for i in {1..5}; do
+    sudo mkdir -p /mnt/disks/vol${i}
+    sudo mount -t tmpfs -o size=1G tmpfs /mnt/disks/vol${i}
+done
+
+# Option B: For production - Use real disk partitions
+# Example for each disk:
+# sudo mkfs.xfs -f /dev/sdX
+# sudo mkdir -p /mnt/disks/volX  
+# echo '/dev/sdX /mnt/disks/volX xfs defaults,noatime 0 2' | sudo tee -a /etc/fstab
+# sudo mount -a
+
+# 8. Create helm-repository storage directory (workers only)
+sudo mkdir -p /var/tmp/helm-repo
+sudo chmod 777 /var/tmp/helm-repo
+
+# 9. Create Prometheus directory (workers only)
 sudo mkdir -p /mnt/prometheus
 sudo chmod 777 /mnt/prometheus
 
