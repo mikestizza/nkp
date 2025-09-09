@@ -68,7 +68,6 @@ done
 echo "=== Cleaning local files ==="
 rm -f nkp-poc.conf nkp-poc-bootstrap.conf
 rm -f kommander.yaml
-rm -f preprovisioned_inventory.yaml
 
 # Verification checks
 echo ""
