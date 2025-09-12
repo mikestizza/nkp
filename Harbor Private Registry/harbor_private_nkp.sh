@@ -14,6 +14,12 @@ DEFAULT_HARBOR_PASSWORD="Harbor12345"
 DEFAULT_NKP_VERSION="2.15.0"
 DEFAULT_HARBOR_PROJECT="nkp"
 
+# Prompt for password if not set
+if [ -z "$HARBOR_PASSWORD" ]; then
+    read -s -p "Enter Harbor password: " HARBOR_PASSWORD
+    echo ""
+fi
+
 # Minimum system requirements
 MIN_DISK_SPACE_GB=50
 MIN_MEMORY_GB=4
