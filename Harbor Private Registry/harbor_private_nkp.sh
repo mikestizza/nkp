@@ -4,7 +4,7 @@
 set -e
 
 # Version and metadata
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 SCRIPT_NAME="Enhanced NKP Harbor Deployment"
 
 # Default configuration - can be overridden
@@ -280,8 +280,10 @@ validate_docker_environment() {
         fi
     fi
     
-    # Check for conflicting containerd installations
-    if dpkg -l | grep -q containerd.io && dpkg -l | grep -q containerd && ! dpkg -l | grep -q docker.io; then
+    # Check for conflicting containerd installations (FIXED)
+    # Only flag as issue if we have BOTH containerd AND containerd.io
+    if dpkg -l | awk '$2 == "containerd" && $1 == "ii" {exit 0} END {exit 1}' && \
+       dpkg -l | grep -q "^ii.*containerd.io"; then
         issues+=("Conflicting containerd packages detected")
         auto_fixes+=("fix_containerd:Resolve containerd conflicts")
     fi
@@ -537,7 +539,8 @@ install_nkp_binary() {
         
         read -p "Download NKP automatically? (y/N): " input
         if [[ "${input,,}" =~ ^y ]]; then
-            return download_nkp_binary
+            download_nkp_binary
+            return $?
         else
             return 1
         fi
@@ -692,7 +695,7 @@ apply_harbor_fix() {
     esac
 }
 
-# Helper function to install Harbor from package
+# Helper function to install Harbor from package (FIXED)
 install_harbor_from_package() {
     local package_file="$1"
     local temp_dir=$(mktemp -d)
@@ -701,6 +704,8 @@ install_harbor_from_package() {
     if tar -xzf "$package_file" -C "$temp_dir"; then
         local harbor_dir="$temp_dir/harbor"
         if [[ -d "$harbor_dir" ]]; then
+            # Save current directory
+            local original_dir=$(pwd)
             cd "$harbor_dir"
             
             # Create basic configuration
@@ -712,29 +717,44 @@ install_harbor_from_package() {
                 sed -i "s/hostname: reg.mydomain.com/hostname: ${host_ip:-localhost}/" harbor.yml
                 sed -i '/^https:/,/^[[:space:]]*certificate:/ s/^/#/' harbor.yml
                 sed -i '/^[[:space:]]*private_key:/ s/^/#/' harbor.yml
+                
+                # Set default admin password
+                sed -i "s/harbor_admin_password: .*/harbor_admin_password: Harbor12345/" harbor.yml
             fi
             
             # Install Harbor
             if sudo ./install.sh; then
-                cd - > /dev/null
+                cd "$original_dir"
                 rm -rf "$temp_dir"
                 return 0
+            else
+                cd "$original_dir"
+                rm -rf "$temp_dir"
+                return 1
             fi
+        else
+            error "Harbor directory not found in extracted archive"
+            rm -rf "$temp_dir"
+            return 1
         fi
+    else
+        error "Failed to extract Harbor installer"
+        rm -rf "$temp_dir"
+        return 1
     fi
-    
-    rm -rf "$temp_dir"
-    return 1
 }
 
-# Helper function to download and install Harbor
+# Helper function to download and install Harbor (FIXED)
 download_and_install_harbor() {
     local harbor_version="v2.10.0"
     local harbor_url="https://github.com/goharbor/harbor/releases/download/${harbor_version}/harbor-offline-installer-${harbor_version}.tgz"
     
     log "Downloading Harbor ${harbor_version}..."
     if curl -L "$harbor_url" -o "harbor-offline-installer-${harbor_version}.tgz"; then
-        return install_harbor_from_package "harbor-offline-installer-${harbor_version}.tgz"
+        # Call the function and capture its exit status
+        install_harbor_from_package "harbor-offline-installer-${harbor_version}.tgz"
+        local result=$?
+        return $result
     else
         return 1
     fi
@@ -1047,33 +1067,41 @@ build_harbor_url() {
     fi
 }
 
-# Verify prerequisites with enhanced checking
+# Verify prerequisites with enhanced checking (FIXED JQ ISSUE)
 verify_prerequisites() {
     log "Verifying prerequisites..."
     
     local missing_tools=()
-    local version_issues=()
     
-    # Check required tools with version validation
-    local tools_versions=(
-        "docker:Docker version"
-        "curl:curl"
-        "jq:jq"
-        "nkp:nkp version"
-    )
+    # Check required tools - FIXED version checking
+    if ! command -v docker &> /dev/null; then
+        missing_tools+=("docker")
+    else
+        local docker_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "installed")
+        success "docker available (version: $docker_version)"
+    fi
     
-    for tool_info in "${tools_versions[@]}"; do
-        local tool="${tool_info%%:*}"
-        local version_cmd="${tool_info##*:}"
-        
-        if ! command -v "$tool" &> /dev/null; then
-            missing_tools+=("$tool")
-        else
-            # Get version info for diagnostic purposes
-            local version_output=$($version_cmd 2>/dev/null || echo "version unknown")
-            success "$tool available: $version_output"
-        fi
-    done
+    if ! command -v curl &> /dev/null; then
+        missing_tools+=("curl")
+    else
+        local curl_version=$(curl --version 2>/dev/null | head -1 | awk '{print $2}' || echo "installed")
+        success "curl available (version: $curl_version)"
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        missing_tools+=("jq")
+    else
+        # Fixed: jq --version outputs to stderr, redirect properly
+        local jq_version=$(jq --version 2>&1 | head -1 || echo "installed")
+        success "jq available (version: $jq_version)"
+    fi
+    
+    if ! command -v nkp &> /dev/null; then
+        missing_tools+=("nkp")
+    else
+        local nkp_version=$(nkp version 2>/dev/null | head -1 || echo "installed")
+        success "nkp available (version: $nkp_version)"
+    fi
     
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         error "Missing required tools: ${missing_tools[*]}"
