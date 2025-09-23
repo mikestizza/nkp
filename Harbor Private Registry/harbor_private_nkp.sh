@@ -272,7 +272,7 @@ setup_local_harbor() {
         local installer=$(ls harbor-offline-installer-*.tgz 2>/dev/null | head -1)
         if [[ -z "$installer" ]]; then
             error "Harbor installer not found"
-            info "Please download harbor-offline-installer-*.tgz"
+            info "Please download harbor-offline-installer-*.tgz. Example: wget https://github.com/goharbor/harbor/releases/download/v2.9.1/harbor-offline-installer-v2.9.1.tgz"
             exit 1
         fi
         
