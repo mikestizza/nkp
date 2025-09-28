@@ -1,9 +1,9 @@
 #!/bin/bash
-# Harbor Deployment Script - Standalone Installation
+# Harbor Deployment Script - Standalone Installation with Enhanced Error Handling
 set -e
 
 # Version and metadata
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 SCRIPT_NAME="Harbor Deployment Script"
 
 # Harbor Configuration
@@ -183,6 +183,32 @@ stop_harbor() {
     fi
 }
 
+# Fix Harbor permissions
+fix_harbor_permissions() {
+    log "Fixing Harbor permissions..."
+    
+    # Fix ownership for common directory
+    if [[ -d "./common" ]]; then
+        sudo chown -R $(id -u):$(id -g) ./common
+        sudo chmod -R 755 ./common
+        success "Permissions fixed for common directory"
+    fi
+    
+    # Fix data directory if it exists
+    if [[ -d "./data" ]]; then
+        sudo chown -R 10000:10000 ./data
+        sudo chmod -R 755 ./data
+        success "Permissions fixed for data directory"
+    fi
+    
+    # Fix log directory
+    if [[ -d "./log" ]]; then
+        sudo chown -R 10000:10000 ./log
+        sudo chmod -R 755 ./log
+        success "Permissions fixed for log directory"
+    fi
+}
+
 # Download Harbor installer
 download_harbor() {
     local installer_file="harbor-offline-installer-v${HARBOR_VERSION}.tgz"
@@ -265,17 +291,50 @@ install_harbor() {
     cd ..
 }
 
-# Wait for Harbor to be ready
+# Enhanced wait for Harbor with recovery
 wait_for_harbor() {
     log "Waiting for Harbor to be ready..."
     
     local max_attempts=30
     local attempt=0
+    local recovery_attempted=false
     
     while [[ $attempt -lt $max_attempts ]]; do
+        # Check if containers are actually running
+        if ! docker ps | grep -q "harbor-core"; then
+            if [[ "$recovery_attempted" == "false" ]]; then
+                warning "Harbor containers not running. Attempting recovery..."
+                
+                cd harbor 2>/dev/null || true
+                
+                # Check for permission errors in logs
+                if $DOCKER_COMPOSE logs 2>&1 | grep -q "permission denied"; then
+                    error "Permission issue detected. Fixing..."
+                    fix_harbor_permissions
+                fi
+                
+                # Try to start Harbor
+                log "Starting Harbor containers..."
+                $DOCKER_COMPOSE up -d
+                
+                cd .. 2>/dev/null || true
+                recovery_attempted=true
+                sleep 10
+                continue
+            fi
+        fi
+        
+        # Check health endpoint
         if curl -s "http://${HARBOR_HOST}:${HARBOR_PORT}/api/v2.0/health" 2>/dev/null | grep -q "healthy"; then
             echo ""
             success "Harbor is ready!"
+            return 0
+        fi
+        
+        # Also check if we can reach the login page
+        if curl -s "http://${HARBOR_HOST}:${HARBOR_PORT}/harbor/sign-in" 2>/dev/null | grep -q "Harbor"; then
+            echo ""
+            success "Harbor UI is accessible!"
             return 0
         fi
         
@@ -287,10 +346,16 @@ wait_for_harbor() {
     echo ""
     error "Harbor failed to become ready"
     error "Check logs: cd harbor && $DOCKER_COMPOSE logs"
+    
+    # Show container status
+    echo ""
+    warning "Container Status:"
+    docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep harbor || true
+    
     exit 1
 }
 
-# Configure Docker daemon
+# Configure Docker daemon with enhanced error handling
 configure_docker_daemon() {
     log "Configuring Docker daemon for insecure registry..."
     
@@ -304,12 +369,12 @@ configure_docker_daemon() {
     local needs_restart=false
     
     if [[ -f "$daemon_json" ]]; then
-        if ! jq -e --arg registry "$registry_entry" '.["insecure-registries"] | select(. != null) | index($registry)' "$daemon_json" > /dev/null 2>&1; then
+        if ! sudo jq -e --arg registry "$registry_entry" '.["insecure-registries"] | select(. != null) | index($registry)' "$daemon_json" > /dev/null 2>&1; then
             log "Adding $registry_entry to insecure-registries..."
             sudo cp "$daemon_json" "${daemon_json}.backup.$(date +%Y%m%d_%H%M%S)"
             
             local temp_file=$(mktemp)
-            jq --arg registry "$registry_entry" \
+            sudo jq --arg registry "$registry_entry" \
                 '.["insecure-registries"] = (.["insecure-registries"] // []) + [$registry] | .["insecure-registries"] |= unique' \
                 "$daemon_json" > "$temp_file"
             sudo mv "$temp_file" "$daemon_json"
@@ -326,11 +391,39 @@ configure_docker_daemon() {
         log "Restarting Docker daemon..."
         sudo systemctl restart docker
         sleep 5
+        
+        # Verify Docker is running
+        if ! docker info &> /dev/null; then
+            error "Docker failed to restart properly"
+            sudo systemctl status docker
+            exit 1
+        fi
+        
         success "Docker daemon restarted"
         
-        # Restart Harbor after Docker restart
-        log "Restarting Harbor after Docker restart..."
-        cd harbor && $DOCKER_COMPOSE up -d && cd ..
+        # Pre-emptively fix permissions before restarting Harbor
+        log "Ensuring Harbor permissions are correct..."
+        if [[ -d "./harbor" ]]; then
+            cd harbor
+            fix_harbor_permissions
+            
+            # Restart Harbor with proper error handling
+            log "Restarting Harbor after Docker restart..."
+            
+            # First, ensure old containers are stopped
+            $DOCKER_COMPOSE down 2>/dev/null || true
+            sleep 3
+            
+            # Start Harbor
+            if ! $DOCKER_COMPOSE up -d; then
+                error "Failed to start Harbor. Attempting recovery..."
+                fix_harbor_permissions
+                $DOCKER_COMPOSE up -d
+            fi
+            
+            cd ..
+        fi
+        
         wait_for_harbor
     fi
 }
@@ -342,6 +435,9 @@ create_harbor_project() {
     log "Creating Harbor project: $project_name"
     
     local api_url="http://${HARBOR_HOST}:${HARBOR_PORT}/api/v2.0"
+    
+    # Wait a bit for API to be fully ready
+    sleep 5
     
     # Check if project exists
     local existing=$(curl -s -u "admin:${HARBOR_ADMIN_PASSWORD}" \
@@ -382,8 +478,20 @@ test_harbor_login() {
         docker logout "${HARBOR_HOST}:${HARBOR_PORT}" &> /dev/null
     else
         error "Docker login failed"
+        warning "Try manually: docker login ${HARBOR_HOST}:${HARBOR_PORT} -u admin"
         return 1
     fi
+}
+
+# Cleanup function for script interruption
+cleanup() {
+    echo ""
+    warning "Script interrupted. Cleaning up..."
+    
+    # Return to original directory if needed
+    cd "$ORIGINAL_DIR" 2>/dev/null || true
+    
+    exit 1
 }
 
 # Generate summary
@@ -428,6 +536,11 @@ generate_summary() {
     echo "  Logs:     cd harbor && $DOCKER_COMPOSE logs -f"
     echo "  Status:   docker ps | grep harbor"
     echo ""
+    echo -e "${CYAN}Troubleshooting:${NC}"
+    echo "  Fix permissions: cd harbor && sudo chown -R \$(id -u):\$(id -g) ./common ./data"
+    echo "  Restart all:     cd harbor && $DOCKER_COMPOSE down && $DOCKER_COMPOSE up -d"
+    echo "  View core logs:  cd harbor && $DOCKER_COMPOSE logs harbor-core"
+    echo ""
     echo -e "${CYAN}Test Commands:${NC}"
     echo "  Pull test: docker pull ${HARBOR_HOST}:${HARBOR_PORT}/${HARBOR_PROJECT}/pause:3.10"
     echo "  List repos: curl -u admin:${HARBOR_ADMIN_PASSWORD} http://${HARBOR_HOST}:${HARBOR_PORT}/api/v2.0/projects/${HARBOR_PROJECT}/repositories"
@@ -436,6 +549,12 @@ generate_summary() {
 
 # Main execution
 main() {
+    # Save original directory
+    ORIGINAL_DIR=$(pwd)
+    
+    # Setup trap for cleanup
+    trap cleanup INT TERM
+    
     show_banner
     
     # System checks
